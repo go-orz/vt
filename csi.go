@@ -1,5 +1,10 @@
 package vt
 
+import (
+	"strconv"
+	"strings"
+)
+
 func (vt *virtualTerminal) initCsiHandler() {
 	vt.addCsiHandler('@', vt.insertChar)
 	vt.addCsiHandler('A', vt.cursorUp)
@@ -177,6 +182,33 @@ func (vt *virtualTerminal) hVPosition(params []rune) error {
 	return vt.cursorPosition(params)
 }
 
+func (vt *virtualTerminal) parseCSIParams(params []rune) (isPrivate bool, values []int) {
+	paramStr := string(params)
+	if strings.HasPrefix(paramStr, "?") {
+		isPrivate = true
+		paramStr = paramStr[1:]
+	}
+
+	if paramStr == "" {
+		return isPrivate, []int{}
+	}
+
+	parts := strings.Split(paramStr, ";")
+	for _, part := range parts {
+		if part == "" {
+			values = append(values, 0)
+			continue
+		}
+		val, err := strconv.Atoi(part)
+		if err != nil {
+			values = append(values, 0) // Default on error
+		} else {
+			values = append(values, val)
+		}
+	}
+	return isPrivate, values
+}
+
 /**
  * CSI Pm h  Set Mode (SM).
  *     Ps = 2  -> Keyboard Action Mode (AM).
@@ -195,22 +227,50 @@ func (vt *virtualTerminal) hVPosition(params []rune) error {
  * | 20    | Automatic Newline (LNM). Always off.   | #N      |
  */
 func (vt *virtualTerminal) setMode(params []rune) error {
-	for _, param := range params {
-		ps := vt.getNumberOrDefault([]rune{param}, 0, 0)
-		if ps == 4 {
-			vt.insertMode = true
-			break
+	isPrivate, values := vt.parseCSIParams(params)
+
+	if isPrivate {
+		for _, ps := range values {
+			switch ps {
+			case 1049, 1047, 47: // Alternate Screen Buffer
+				if vt.parserState != stateAlternateScreen {
+					vt.parserState = stateAlternateScreen
+					if vt.OnEnterApplicationMode != nil {
+						vt.OnEnterApplicationMode()
+					}
+				}
+			}
+		}
+	} else {
+		for _, ps := range values {
+			if ps == 4 { // Insert Mode (IRM)
+				vt.insertMode = true
+			}
 		}
 	}
 	return nil
 }
 
 func (vt *virtualTerminal) resetMode(params []rune) error {
-	for _, param := range params {
-		ps := vt.getNumberOrDefault([]rune{param}, 0, 0)
-		if ps == 4 {
-			vt.insertMode = false
-			break
+	isPrivate, values := vt.parseCSIParams(params)
+
+	if isPrivate {
+		for _, ps := range values {
+			switch ps {
+			case 1049, 1047, 47: // Alternate Screen Buffer
+				if vt.parserState == stateAlternateScreen {
+					vt.parserState = stateReadingOutput
+					if vt.OnExitApplicationMode != nil {
+						vt.OnExitApplicationMode()
+					}
+				}
+			}
+		}
+	} else {
+		for _, ps := range values {
+			if ps == 4 { // Insert Mode (IRM)
+				vt.insertMode = false
+			}
 		}
 	}
 	return nil

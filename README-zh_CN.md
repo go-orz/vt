@@ -17,7 +17,7 @@ package main
 import (
 	"log"
 
-	"github.com/dushixiang/vt"
+	"github.com/go-orz/vt"
 )
 
 func main() {
@@ -28,7 +28,7 @@ func main() {
 
 	v := vt.New()
 	v.Advance(content)
-	lines := v.Result()
+	lines := v.Output()
 	for _, line := range lines {
 		println(line)
 	}

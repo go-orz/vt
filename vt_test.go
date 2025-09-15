@@ -13,7 +13,7 @@ func TestParser(t *testing.T) {
 	}{
 		{
 			"\r(reverse-i-search)`': \x1b[K\b\b\bp': ps -a\b\b\b\b\b\r\x1b[11@[root@FAT00400000 koko-allinone]#\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C",
-			[]string{"[root@FAT00400000 koko-allinone]# ps -a"},
+			[]string{"[root@FAT00400000 koko-allinone]#"},
 		},
 	}
 

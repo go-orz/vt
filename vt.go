@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"net/url"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -27,6 +28,11 @@ const (
 	space rune = 0x20 // 空格
 )
 
+const (
+	stateReadingOutput = iota
+	stateAlternateScreen
+)
+
 type inputHandler func(params []rune) error
 
 type VirtualTerminal interface {
@@ -36,19 +42,52 @@ type VirtualTerminal interface {
 	CurrentDir() string
 }
 
-type Opts struct {
-	Logger *log.Logger
+// Opt is a function that configures a virtualTerminal.
+type Opt func(*virtualTerminal)
+
+// WithOnEnterApplicationMode sets a callback for when an application enters alternate screen mode.
+func WithOnEnterApplicationMode(f func()) Opt {
+	return func(vt *virtualTerminal) {
+		vt.OnEnterApplicationMode = f
+	}
+}
+
+// WithOnExitApplicationMode sets a callback for when an application exits alternate screen mode.
+func WithOnExitApplicationMode(f func()) Opt {
+	return func(vt *virtualTerminal) {
+		vt.OnExitApplicationMode = f
+	}
+}
+
+func WithOnDirChange(f func(dir string)) Opt {
+	return func(vt *virtualTerminal) {
+		vt.OnDirChange = f
+	}
+}
+
+// WithLogger sets a logger for the virtual terminal.
+func WithLogger(logger *log.Logger) Opt {
+	return func(vt *virtualTerminal) {
+		vt.logger = logger
+	}
 }
 
 func New() VirtualTerminal {
-	vt := virtualTerminal{
+	return NewWithOptions()
+}
+
+func NewWithOptions(opts ...Opt) VirtualTerminal {
+	vt := &virtualTerminal{
 		inputHandlers: make(map[byte]inputHandler),
 		rowList:       make([]*Row, 0),
 		rows:          0,
 		logger:        nil,
 	}
+	for _, opt := range opts {
+		opt(vt)
+	}
 	vt.initCsiHandler()
-	return &vt
+	return vt
 }
 
 type virtualTerminal struct {
@@ -60,6 +99,12 @@ type virtualTerminal struct {
 	logger        *log.Logger
 
 	currentDir string
+
+	OnEnterApplicationMode func()
+	OnExitApplicationMode  func()
+	OnDirChange            func(dir string)
+
+	parserState int
 }
 
 func (vt *virtualTerminal) addCsiHandler(b byte, handler inputHandler) {
@@ -122,8 +167,9 @@ func (vt *virtualTerminal) handleCSISequence(p []byte) []byte {
 		} else {
 			vt.log(fmt.Sprintf("no match input handler for %q %v", b, b))
 		}
+		return p[index+1:]
 	}
-	return p[index+1:]
+	return nil
 }
 
 // 启动操作系统使用的控制字符串。OSC序列与CSI序列相似，但不限于整数参数。
@@ -131,41 +177,88 @@ func (vt *virtualTerminal) handleCSISequence(p []byte) []byte {
 // 在xterm中，它们也可能被BEL终止[13]。
 // 例如，在xterm中，窗口标题可以这样设置：OSC 0;this is the window title _BEL。
 func (vt *virtualTerminal) handleOSCSequence(p []byte) []byte {
-	idx := bytes.IndexRune(p, _SEMICOLON)
-	if idx >= 0 {
-		osc, _ := strconv.Atoi(string(p[:idx]))
-		switch osc {
-		case 1337:
-			content := string(p[idx+1:])
-			parts := strings.Split(content, "=")
-			if len(parts) == 2 {
-				vt.currentDir = parts[1]
+	// 查找终止符
+	stIndex := bytes.IndexRune(p, _ST)
+	belIndex := bytes.IndexRune(p, _BEL)
+
+	endIndex := -1
+	switch {
+	case stIndex != -1 && belIndex != -1:
+		if stIndex < belIndex {
+			endIndex = stIndex
+		} else {
+			endIndex = belIndex
+		}
+	case stIndex != -1:
+		endIndex = stIndex
+	case belIndex != -1:
+		endIndex = belIndex
+	}
+
+	if endIndex == -1 {
+		return nil // 没有终止符
+	}
+
+	payload := p[:endIndex]
+	rest := p[endIndex+1:]
+
+	// 分割 OSC 号和内容
+	parts := bytes.SplitN(payload, []byte{';'}, 2)
+	if len(parts) < 2 {
+		return rest // malformed OSC
+	}
+
+	osc, err := strconv.Atoi(strings.TrimSpace(string(parts[0])))
+	if err != nil {
+		return rest // malformed OSC
+	}
+
+	content := string(parts[1])
+
+	switch osc {
+	case 7: // OSC 7: file:// URI
+		if u, err := url.Parse(content); err == nil && u.Scheme == "file" {
+			vt.updateDir(u.Path)
+		}
+	case 1337: // iTerm2 proprietary: CurrentDir
+		subParts := strings.SplitN(content, "=", 2)
+		if len(subParts) == 2 && subParts[0] == "CurrentDir" {
+			if dir, err := url.PathUnescape(subParts[1]); err == nil {
+				vt.updateDir(dir)
 			}
 		}
 	}
-	if index := bytes.IndexRune(p, _ST); index >= 0 {
-		return p[index+1:]
+
+	return rest
+}
+
+func (vt *virtualTerminal) updateDir(dir string) {
+	if vt.currentDir != dir {
+		vt.currentDir = dir
+		if vt.OnDirChange != nil {
+			vt.OnDirChange(vt.currentDir)
+		}
 	}
-	if index := bytes.IndexRune(p, _BEL); index >= 0 {
-		return p[index+1:]
-	}
-	return p
 }
 
 // https://zh.wikipedia.org/zh/C0%E4%B8%8EC1%E6%8E%A7%E5%88%B6%E5%AD%97%E7%AC%A6
 func (vt *virtualTerminal) handleC0Sequence(code rune) {
 	switch code {
 	case _BEL: // \a 发出可听见的噪音。
-	case _BS: // \b 将光标向左移动一个字符
-		vt.moveBackward(1)
+	case _BS: // \b 将光标向左移动一个字符并删除
+		row := vt.getCurrentRow()
+		// 使用 backspace 方法，它会同时处理删除和光标移动
+		row.backspace()
 	case _HT: // \t 定位到下一个制表位。
-		// TODO
-	case _LF: // \n 将光标移动到下一行,但不改变所在的列的位置
+		// 插入制表符或空格
+		vt.appendCharacter(_HT)
+	case _LF:
 		vt.moveDown(1)
+		vt.setCol(0) // 换行时也要回到行首
+	case _CR: // \n or \r
+		vt.setCol(0) // 仅回到行首，不换行
 	case _VT: // \v 定位到下一行的制表位。
 		// TODO
-	case _CR: // \r 将光标移动到当前行的最左边。
-		vt.moveTo(0, vt.rows)
 	case _DEL: // 最初用于穿孔纸带上删除一个字符。因为任何位置的字符都可以被全部穿孔（全1）。VT100兼容终端，按键⌫产生这个字符，常称为backspace，但不对应于PC键盘的delete key。
 		// TODO
 	}

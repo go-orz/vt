@@ -2,27 +2,38 @@ package vt
 
 // insert 向指定位置插入元素
 func insert(data []rune, index int, val rune) []rune {
-	if len(data) < index {
-		return data
+	if index > len(data) {
+		paddingSize := index - len(data)
+		padding := make([]rune, paddingSize)
+		for i := 0; i < paddingSize; i++ {
+			padding[i] = space
+		}
+		data = append(data, padding...)
 	}
-	data = append(data, 0)
-	copy(data[index+1:], data[index:])
-	data[index] = val
-	return data
+
+	if index >= len(data) {
+		return append(data, val)
+	}
+
+	// Insert in the middle
+	suffix := append([]rune{val}, data[index:]...)
+	return append(data[:index], suffix...)
 }
 
 // remove 从某个位置开始删除n个元素
-func remove(data []rune, index, num int) (result []rune) {
-	if index < len(data) {
-		result = append(result, data[0:index]...)
+func remove(data []rune, index, num int) []rune {
+	if index >= len(data) {
+		return data
 	}
-	if index+num < len(data) {
-		result = append(result, data[index+num:]...)
+	end := index + num
+	if end > len(data) {
+		end = len(data)
 	}
-	return result
+	return append(data[:index], data[end:]...)
 }
 
-/** C0 控制字符
+/*
+* C0 控制字符
 00000000	0	00	NUL (NULL)	空字符
 00000001	1	01	SOH (Start Of Headling)	标题开始
 00000010	2	02	STX (Start Of Text)	正文开始
@@ -61,7 +72,8 @@ func isC0Sequence(code rune) bool {
 	return (code >= 0 && code <= 31) || code == 127
 }
 
-/** CSI 序列
+/*
+* CSI 序列
 
 组成部分	字符范围	ASCII
 参数字节	0x30–0x3F	0–9:;<=>?
