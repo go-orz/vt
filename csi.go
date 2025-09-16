@@ -90,13 +90,19 @@ func (vt *virtualTerminal) cursorCharAbsolute(params []rune) error {
 // 光标移动到第n行、第m列。值从1开始，且默认为1（左上角）。
 // 例如CSI ;5H和CSI 1;5H含义相同；CSI 17;H、CSI 17H和CSI 17;1H三者含义相同。
 func (vt *virtualTerminal) cursorPosition(params []rune) error {
-	if len(params) >= 2 {
-		row := vt.getNumberOrDefault(params, 0, 1)
-		col := vt.getNumberOrDefault(params, 1, 1)
-		vt.moveTo(col, row)
-	} else {
-		vt.resetCursor()
+	_, values := vt.parseCSIParams(params)
+
+	row := 1
+	col := 1
+
+	if len(values) > 0 && values[0] > 0 {
+		row = values[0]
 	}
+	if len(values) > 1 && values[1] > 0 {
+		col = values[1]
+	}
+
+	vt.moveTo(col, row)
 	return nil
 }
 
@@ -131,7 +137,7 @@ func (vt *virtualTerminal) eraseInLine(params []rune) error {
 	case 1:
 		return vt.eraseLeft()
 	case 2:
-		return vt.eraseAll()
+		return vt.eraseCurrentLine()
 	}
 	return nil
 }
@@ -151,7 +157,7 @@ func (vt *virtualTerminal) eraseChars(params []rune) error {
 
 // Character Position Absolute  [column] (default = [rows,1])
 func (vt *virtualTerminal) charPosAbsolute(params []rune) error {
-	ps := vt.getNumberOrDefault(params, 0, 1) - 1
+	ps := vt.getNumberOrDefault(params, 0, 1)
 	vt.moveTo(ps, vt.rows)
 	return nil
 }
@@ -165,7 +171,7 @@ func (vt *virtualTerminal) hPositionRelative(params []rune) error {
 
 // 行定位绝对[ROW]（default = [1，列]）（VPA）。
 func (vt *virtualTerminal) linePosAbsolute(params []rune) error {
-	ps := vt.getNumberOrDefault(params, 0, 1) - 1
+	ps := vt.getNumberOrDefault(params, 0, 1)
 	vt.setRow(ps)
 	return nil
 }
@@ -212,7 +218,7 @@ func (vt *virtualTerminal) parseCSIParams(params []rune) (isPrivate bool, values
 /**
  * CSI Pm h  Set Mode (SM).
  *     Ps = 2  -> Keyboard Action Mode (AM).
- *     Ps = 4  -> insert Mode (IRM).
+ *     Ps = 4  -> insert Mode (IRM). Insert/Replace Mode
  *     Ps = 1 2  -> Send/receive (SRM).
  *     Ps = 2 0  -> Automatic Newline (LNM).
  *
@@ -227,52 +233,12 @@ func (vt *virtualTerminal) parseCSIParams(params []rune) (isPrivate bool, values
  * | 20    | Automatic Newline (LNM). Always off.   | #N      |
  */
 func (vt *virtualTerminal) setMode(params []rune) error {
-	isPrivate, values := vt.parseCSIParams(params)
-
-	if isPrivate {
-		for _, ps := range values {
-			switch ps {
-			case 1049, 1047, 47: // Alternate Screen Buffer
-				if vt.parserState != stateAlternateScreen {
-					vt.parserState = stateAlternateScreen
-					if vt.OnEnterApplicationMode != nil {
-						vt.OnEnterApplicationMode()
-					}
-				}
-			}
-		}
-	} else {
-		for _, ps := range values {
-			if ps == 4 { // Insert Mode (IRM)
-				vt.insertMode = true
-			}
-		}
-	}
+	// 简化模式设置，只保留基本功能
 	return nil
 }
 
 func (vt *virtualTerminal) resetMode(params []rune) error {
-	isPrivate, values := vt.parseCSIParams(params)
-
-	if isPrivate {
-		for _, ps := range values {
-			switch ps {
-			case 1049, 1047, 47: // Alternate Screen Buffer
-				if vt.parserState == stateAlternateScreen {
-					vt.parserState = stateReadingOutput
-					if vt.OnExitApplicationMode != nil {
-						vt.OnExitApplicationMode()
-					}
-				}
-			}
-		}
-	} else {
-		for _, ps := range values {
-			if ps == 4 { // Insert Mode (IRM)
-				vt.insertMode = false
-			}
-		}
-	}
+	// 简化模式重置，只保留基本功能
 	return nil
 }
 
@@ -290,14 +256,20 @@ func (vt *virtualTerminal) setScrollRegion(params []rune) error {
 }
 
 func (vt *virtualTerminal) eraseBelow() error {
-	if len(vt.rowList) > vt.rows {
+	if vt.rows > 0 && vt.rows <= len(vt.rowList) {
+		// 保留当前行及以上的内容
 		vt.rowList = vt.rowList[:vt.rows]
 	}
 	return nil
 }
 
 func (vt *virtualTerminal) eraseAbove() error {
-	vt.rowList = vt.rowList[vt.rows-1:]
+	if vt.rows > 1 && vt.rows <= len(vt.rowList) {
+		// 保留当前行及以下的内容
+		vt.rowList = vt.rowList[vt.rows-1:]
+		// 重置行号
+		vt.rows = 1
+	}
 	return nil
 }
 
@@ -316,6 +288,13 @@ func (vt *virtualTerminal) eraseRight() error {
 func (vt *virtualTerminal) eraseLeft() error {
 	row := vt.getCurrentRow()
 	row.eraseLeft()
+	return nil
+}
+
+func (vt *virtualTerminal) eraseCurrentLine() error {
+	row := vt.getCurrentRow()
+	row.data = []rune{}
+	row.index = 0
 	return nil
 }
 

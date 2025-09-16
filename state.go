@@ -1,8 +1,10 @@
 package vt
 
 func (vt *virtualTerminal) resetCursor() {
-	vt.getCurrentRow().setIndex(0)
-	vt.rows = 0
+	vt.rows = 1
+	if len(vt.rowList) > 0 {
+		vt.getCurrentRow().setIndex(0)
+	}
 }
 
 func (vt *virtualTerminal) moveTo(col, row int) {
@@ -11,17 +13,23 @@ func (vt *virtualTerminal) moveTo(col, row int) {
 }
 
 func (vt *virtualTerminal) setRow(row int) {
+	if row < 1 {
+		row = 1
+	}
 	vt.rows = row
 }
 
 func (vt *virtualTerminal) setCol(col int) {
+	if col < 0 {
+		col = 0
+	}
 	vt.getCurrentRow().setIndex(col)
 }
 
 func (vt *virtualTerminal) moveUp(ps int) {
 	vt.rows -= ps
-	if vt.rows < 0 {
-		vt.rows = 0
+	if vt.rows < 1 {
+		vt.rows = 1
 	}
 }
 

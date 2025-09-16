@@ -4,9 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"log"
-	"net/url"
 	"strconv"
-	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -21,16 +20,9 @@ const (
 	_ESC rune = 0x1b // Escape (Caret = ^[, C = \e)
 	_DEL rune = 0x7f // Delete (Caret = ^?)
 
-	_SEMICOLON rune = 0x3b // ;
-
 	_ST rune = 0x9c // String Terminator
 
 	space rune = 0x20 // 空格
-)
-
-const (
-	stateReadingOutput = iota
-	stateAlternateScreen
 )
 
 type inputHandler func(params []rune) error
@@ -39,31 +31,10 @@ type VirtualTerminal interface {
 	Advance(p []byte)
 	Output() []string
 	Reset()
-	CurrentDir() string
 }
 
 // Opt is a function that configures a virtualTerminal.
 type Opt func(*virtualTerminal)
-
-// WithOnEnterApplicationMode sets a callback for when an application enters alternate screen mode.
-func WithOnEnterApplicationMode(f func()) Opt {
-	return func(vt *virtualTerminal) {
-		vt.OnEnterApplicationMode = f
-	}
-}
-
-// WithOnExitApplicationMode sets a callback for when an application exits alternate screen mode.
-func WithOnExitApplicationMode(f func()) Opt {
-	return func(vt *virtualTerminal) {
-		vt.OnExitApplicationMode = f
-	}
-}
-
-func WithOnDirChange(f func(dir string)) Opt {
-	return func(vt *virtualTerminal) {
-		vt.OnDirChange = f
-	}
-}
 
 // WithLogger sets a logger for the virtual terminal.
 func WithLogger(logger *log.Logger) Opt {
@@ -91,20 +62,12 @@ func NewWithOptions(opts ...Opt) VirtualTerminal {
 }
 
 type virtualTerminal struct {
+	sync.RWMutex
 	rowList []*Row // 行数据
 	rows    int    // 行数量
 
 	inputHandlers map[byte]inputHandler
-	insertMode    bool // 暂时没啥用
 	logger        *log.Logger
-
-	currentDir string
-
-	OnEnterApplicationMode func()
-	OnExitApplicationMode  func()
-	OnDirChange            func(dir string)
-
-	parserState int
 }
 
 func (vt *virtualTerminal) addCsiHandler(b byte, handler inputHandler) {
@@ -113,33 +76,27 @@ func (vt *virtualTerminal) addCsiHandler(b byte, handler inputHandler) {
 
 func (vt *virtualTerminal) getCurrentRow() *Row {
 	if len(vt.rowList) == 0 {
-		vt.rowList = append(vt.rowList, vt.newRow())
-		vt.rows = 1
+		vt.newRow()
 	}
 
-	if len(vt.rowList) < vt.rows {
-		count := vt.rows - len(vt.rowList)
-		for i := 0; i < count; i++ {
-			vt.rowList = append(vt.rowList, vt.newRow())
+	if vt.rows >= len(vt.rowList) {
+		for i := len(vt.rowList); i <= vt.rows; i++ {
+			vt.newRow()
 		}
 	}
 
-	index := vt.rows - 1
-	if index < 0 {
-		index = 0
-	}
-
-	return vt.rowList[index]
+	return vt.rowList[vt.rows]
 }
 
 func (vt *virtualTerminal) newRow() *Row {
-	return &Row{
+	row := &Row{
 		data:  make([]rune, 0),
 		index: 0,
 	}
+	vt.rowList = append(vt.rowList, row)
+	return row
 }
 
-// https://zh.wikipedia.org/zh/ANSI%E8%BD%AC%E4%B9%89%E5%BA%8F%E5%88%97
 func (vt *virtualTerminal) handleSequence(inputs []byte) []byte {
 	code, size := utf8.DecodeRune(inputs)
 	inputs = inputs[size:]
@@ -169,79 +126,19 @@ func (vt *virtualTerminal) handleCSISequence(p []byte) []byte {
 		}
 		return p[index+1:]
 	}
-	return nil
+
+	return p
 }
 
-// 启动操作系统使用的控制字符串。OSC序列与CSI序列相似，但不限于整数参数。
-// 通常，这些控制序列由ST终止[12]:8.3.89。
-// 在xterm中，它们也可能被BEL终止[13]。
-// 例如，在xterm中，窗口标题可以这样设置：OSC 0;this is the window title _BEL。
 func (vt *virtualTerminal) handleOSCSequence(p []byte) []byte {
-	// 查找终止符
-	stIndex := bytes.IndexRune(p, _ST)
-	belIndex := bytes.IndexRune(p, _BEL)
-
-	endIndex := -1
-	switch {
-	case stIndex != -1 && belIndex != -1:
-		if stIndex < belIndex {
-			endIndex = stIndex
-		} else {
-			endIndex = belIndex
-		}
-	case stIndex != -1:
-		endIndex = stIndex
-	case belIndex != -1:
-		endIndex = belIndex
+	// 找到终止符
+	index := bytes.IndexRune(p, _ST)
+	if index > -1 {
+		return p[index+1:]
 	}
-
-	if endIndex == -1 {
-		return nil // 没有终止符
-	}
-
-	payload := p[:endIndex]
-	rest := p[endIndex+1:]
-
-	// 分割 OSC 号和内容
-	parts := bytes.SplitN(payload, []byte{';'}, 2)
-	if len(parts) < 2 {
-		return rest // malformed OSC
-	}
-
-	osc, err := strconv.Atoi(strings.TrimSpace(string(parts[0])))
-	if err != nil {
-		return rest // malformed OSC
-	}
-
-	content := string(parts[1])
-
-	switch osc {
-	case 7: // OSC 7: file:// URI
-		if u, err := url.Parse(content); err == nil && u.Scheme == "file" {
-			vt.updateDir(u.Path)
-		}
-	case 1337: // iTerm2 proprietary: CurrentDir
-		subParts := strings.SplitN(content, "=", 2)
-		if len(subParts) == 2 && subParts[0] == "CurrentDir" {
-			if dir, err := url.PathUnescape(subParts[1]); err == nil {
-				vt.updateDir(dir)
-			}
-		}
-	}
-
-	return rest
+	return []byte{}
 }
 
-func (vt *virtualTerminal) updateDir(dir string) {
-	if vt.currentDir != dir {
-		vt.currentDir = dir
-		if vt.OnDirChange != nil {
-			vt.OnDirChange(vt.currentDir)
-		}
-	}
-}
-
-// https://zh.wikipedia.org/zh/C0%E4%B8%8EC1%E6%8E%A7%E5%88%B6%E5%AD%97%E7%AC%A6
 func (vt *virtualTerminal) handleC0Sequence(code rune) {
 	switch code {
 	case _BEL: // \a 发出可听见的噪音。
@@ -258,45 +155,72 @@ func (vt *virtualTerminal) handleC0Sequence(code rune) {
 	case _CR: // \n or \r
 		vt.setCol(0) // 仅回到行首，不换行
 	case _VT: // \v 定位到下一行的制表位。
-		// TODO
+		vt.moveDown(1) // 移动到下一行，保持当前列位置
 	case _DEL: // 最初用于穿孔纸带上删除一个字符。因为任何位置的字符都可以被全部穿孔（全1）。VT100兼容终端，按键⌫产生这个字符，常称为backspace，但不对应于PC键盘的delete key。
-		// TODO
+		row := vt.getCurrentRow()
+		row.backspace() // 使用退格操作删除前一个字符
 	}
 }
 
 func (vt *virtualTerminal) log(v ...interface{}) {
 	if vt.logger != nil {
-		log.Println(v...)
+		vt.logger.Println(v...)
 	}
 }
 
 func (vt *virtualTerminal) getNumberOrDefault(params []rune, index, _default int) int {
-	// 下标检查
-	if len(params)-1 < index {
+	if index >= len(params) {
 		return _default
 	}
-	n, err := strconv.Atoi(string(params[index]))
-	if err != nil {
-		n = _default
+
+	var numStr string
+	for i := index; i < len(params); i++ {
+		if params[i] >= '0' && params[i] <= '9' {
+			numStr += string(params[i])
+		} else {
+			break
+		}
 	}
-	return n
+
+	if numStr == "" {
+		return _default
+	}
+
+	if num, err := strconv.Atoi(numStr); err == nil {
+		return num
+	}
+
+	return _default
 }
 
 func (vt *virtualTerminal) getNumberOrDefaultOfBytes(params []byte, index, _default int) int {
-	// 下标检查
-	if len(params)-1 < index {
+	if index >= len(params) {
 		return _default
 	}
-	n, err := strconv.Atoi(string(params[index]))
-	if err != nil {
-		n = _default
+
+	var numStr string
+	for i := index; i < len(params); i++ {
+		if params[i] >= '0' && params[i] <= '9' {
+			numStr += string(params[i])
+		} else {
+			break
+		}
 	}
-	return n
+
+	if numStr == "" {
+		return _default
+	}
+
+	if num, err := strconv.Atoi(numStr); err == nil {
+		return num
+	}
+
+	return _default
 }
 
 func (vt *virtualTerminal) appendCharacter(code rune) {
-	row := vt.getCurrentRow()
-	row.append(code)
+	currentRow := vt.getCurrentRow()
+	currentRow.append(code)
 }
 
 func (vt *virtualTerminal) Advance(p []byte) {
@@ -306,6 +230,12 @@ func (vt *virtualTerminal) Advance(p []byte) {
 func (vt *virtualTerminal) advance(inputs []byte) {
 	for len(inputs) > 0 {
 		code, size := utf8.DecodeRune(inputs)
+		if code == utf8.RuneError && size == 1 {
+			vt.log("无效的UTF-8字符")
+			inputs = inputs[1:]
+			continue
+		}
+
 		inputs = inputs[size:]
 		if _ESC == code {
 			inputs = vt.handleSequence(inputs)
@@ -317,21 +247,32 @@ func (vt *virtualTerminal) advance(inputs []byte) {
 			vt.appendCharacter(code)
 		}
 	}
+	return
 }
 
 func (vt *virtualTerminal) Output() []string {
+	vt.RLock()
+	defer vt.RUnlock()
+
 	var result []string
-	for i := range vt.rowList {
-		line := vt.rowList[i].String()
-		result = append(result, line)
+	for _, row := range vt.rowList {
+		result = append(result, row.String())
 	}
 	return result
 }
 
 func (vt *virtualTerminal) Reset() {
-	_ = vt.eraseAll()
-}
+	vt.Lock()
+	defer vt.Unlock()
 
-func (vt *virtualTerminal) CurrentDir() string {
-	return vt.currentDir
+	// 清理现有行数据，避免内存泄漏
+	for i := range vt.rowList {
+		if vt.rowList[i] != nil {
+			vt.rowList[i].data = nil
+			vt.rowList[i] = nil
+		}
+	}
+	vt.rowList = make([]*Row, 0)
+	vt.rows = 0
+	return
 }

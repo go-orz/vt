@@ -17,7 +17,7 @@ package main
 import (
 	"log"
 
-	"github.com/dushixiang/vt"
+	"github.com/go-orz/vt"
 )
 
 func main() {

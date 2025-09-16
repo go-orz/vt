@@ -2,6 +2,10 @@ package vt
 
 // insert 向指定位置插入元素
 func insert(data []rune, index int, val rune) []rune {
+	if index < 0 {
+		index = 0
+	}
+
 	if index > len(data) {
 		paddingSize := index - len(data)
 		padding := make([]rune, paddingSize)
@@ -22,7 +26,7 @@ func insert(data []rune, index int, val rune) []rune {
 
 // remove 从某个位置开始删除n个元素
 func remove(data []rune, index, num int) []rune {
-	if index >= len(data) {
+	if index < 0 || index >= len(data) || num <= 0 {
 		return data
 	}
 	end := index + num
