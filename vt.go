@@ -63,7 +63,12 @@ type LineHandler func(LineEvent)
 type VirtualTerminal interface {
 	Advance(p []byte)
 	Output() []string
+	// Reset 重置全部状态：屏幕缓冲、光标、私有模式、待回放的行事件。
 	Reset()
+	// ResetScreen 仅重置屏幕缓冲与光标，保留私有模式与待回放事件——
+	// 适合"长会话定期清屏"等场景：调用方希望释放内存但维持 ?2004 / alt
+	// screen 等会话级状态，避免清掉后下一条 prompt 行的 mode 快照不正确。
+	ResetScreen()
 	// IsPrivateModeSet 查询 DEC 私有模式（如 25 光标可见、1049 alt screen、2004 bracketed paste）。
 	IsPrivateModeSet(n int) bool
 }
@@ -399,7 +404,21 @@ func (vt *virtualTerminal) Reset() {
 	vt.Lock()
 	defer vt.Unlock()
 
-	// 清理现有行数据，避免内存泄漏
+	vt.resetScreenLocked()
+	vt.privateModes = make(map[int]bool)
+}
+
+// ResetScreen 仅重置屏幕状态——保留私有模式（如 ?2004 readline、?1049
+// alt screen），避免清掉后下一条 LineEvent 的 Modes 快照失真。
+func (vt *virtualTerminal) ResetScreen() {
+	vt.Lock()
+	defer vt.Unlock()
+
+	vt.resetScreenLocked()
+}
+
+// resetScreenLocked 假定调用方已持有写锁。
+func (vt *virtualTerminal) resetScreenLocked() {
 	for i := range vt.rowList {
 		if vt.rowList[i] != nil {
 			vt.rowList[i].data = nil
@@ -408,6 +427,5 @@ func (vt *virtualTerminal) Reset() {
 	}
 	vt.rowList = make([]*Row, 0)
 	vt.rows = 0
-	vt.privateModes = make(map[int]bool)
 	vt.pendingLines = nil
 }

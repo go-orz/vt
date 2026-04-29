@@ -383,6 +383,26 @@ func TestPrivateModeResetCleared(t *testing.T) {
 	}
 }
 
+// TestResetScreenKeepsModes 验证 ResetScreen 只清屏幕、保留私有模式——
+// 这是给 outputRecognizer 在每条命令后回收内存而不丢 ?2004h 状态用的。
+func TestResetScreenKeepsModes(t *testing.T) {
+	v := New()
+	v.Advance([]byte("\x1b[?2004hroot@host:~# ls\r\n"))
+	v.Advance([]byte("\x1b[?1049h"))
+
+	v.ResetScreen()
+
+	if !v.IsPrivateModeSet(2004) {
+		t.Errorf("ResetScreen should keep ?2004 mode")
+	}
+	if !v.IsPrivateModeSet(1049) {
+		t.Errorf("ResetScreen should keep ?1049 mode")
+	}
+	if out := v.Output(); len(out) != 0 {
+		t.Errorf("ResetScreen should empty Output; got %q", out)
+	}
+}
+
 // ---------- 集成场景：在 SSH 风格输出里识别命令 ----------
 
 func TestLineHandlerIdentifiesCommandUnderPrompt(t *testing.T) {
