@@ -383,6 +383,33 @@ func TestPrivateModeResetCleared(t *testing.T) {
 	}
 }
 
+// TestOSCHandlerCapturesPayload 验证 OSC 序列识别后 payload 被回调出来。
+func TestOSCHandlerCapturesPayload(t *testing.T) {
+	var got []string
+	v := NewWithOptions(WithOSCHandler(func(payload string) {
+		got = append(got, payload)
+	}))
+
+	// 三种终止符（BEL / ST / ESC \）都应当工作
+	v.Advance([]byte("\x1b]1337;CurrentDir=/tmp\x07"))                        // BEL
+	v.Advance([]byte("\x1b]7;file://host/var/log\x9c"))                       // ST
+	v.Advance([]byte("\x1b]0;window title\x1b\\"))                            // ESC \
+
+	want := []string{
+		"1337;CurrentDir=/tmp",
+		"7;file://host/var/log",
+		"0;window title",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d events %q, want %d %q", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("event %d: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 // TestResetScreenKeepsModes 验证 ResetScreen 只清屏幕、保留私有模式——
 // 这是给 outputRecognizer 在每条命令后回收内存而不丢 ?2004h 状态用的。
 func TestResetScreenKeepsModes(t *testing.T) {

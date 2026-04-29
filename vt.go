@@ -102,6 +102,23 @@ func WithLineHandler(h LineHandler) Opt {
 	}
 }
 
+// OSCHandler 在每个完整的 OSC（Operating System Command）序列识别后被调用。
+// payload 是 ESC ] 与终止符（BEL 或 ESC \）之间的文本。
+//
+// 例：终端收到 "\x1b]1337;CurrentDir=/tmp\x07"，OSCHandler 收到 payload
+// 字符串 "1337;CurrentDir=/tmp"。
+//
+// 典型用途：识别 iTerm2 风格 OSC 1337 / VTE 风格 OSC 7 上报当前目录。
+type OSCHandler func(payload string)
+
+// WithOSCHandler 注册 OSC 序列回调。回调在 Advance 处理 OSC 时同步执行
+// （持有内部写锁），handler 应当轻量、不在内部再调 Advance 等取锁的方法。
+func WithOSCHandler(h OSCHandler) Opt {
+	return func(vt *virtualTerminal) {
+		vt.oscHandler = h
+	}
+}
+
 func New() VirtualTerminal {
 	return NewWithOptions()
 }
@@ -132,6 +149,8 @@ type virtualTerminal struct {
 
 	lineHandler  LineHandler
 	pendingLines []pendingLine // commitLogicalLine 在锁内追加，Advance 解锁后回放给 lineHandler
+
+	oscHandler OSCHandler
 
 	logger *log.Logger
 }
@@ -250,8 +269,30 @@ func (vt *virtualTerminal) handleStringSequence(p []byte) []byte {
 	return nil
 }
 
+// handleOSCSequence 消费一个 OSC 序列。与通用 handleStringSequence 不同：
+// 在调用 oscHandler 时把 ESC ] 与终止符之间的 payload 文本传出去，便于
+// 调用方解析 iTerm2 风格 1337 / VTE 风格 7 等扩展。
 func (vt *virtualTerminal) handleOSCSequence(p []byte) []byte {
-	return vt.handleStringSequence(p)
+	for i := range len(p) {
+		switch p[i] {
+		case byte(_BEL), byte(_ST):
+			vt.fireOSC(p[:i])
+			return p[i+1:]
+		case byte(_ESC):
+			if i+1 < len(p) && p[i+1] == '\\' {
+				vt.fireOSC(p[:i])
+				return p[i+2:]
+			}
+			return p[i:]
+		}
+	}
+	return nil
+}
+
+func (vt *virtualTerminal) fireOSC(payload []byte) {
+	if vt.oscHandler != nil && len(payload) > 0 {
+		vt.oscHandler(string(payload))
+	}
 }
 
 func (vt *virtualTerminal) handleC0Sequence(code rune) {
