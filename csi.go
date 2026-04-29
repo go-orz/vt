@@ -32,6 +32,10 @@ func (vt *virtualTerminal) initCsiHandler() {
 
 func (vt *virtualTerminal) cursorChange(params []rune, action func(ps int)) {
 	ps := vt.getNumberOrDefault(params, 0, 1)
+	// VT100/ECMA-48：CSI A/B/C/D/G 等"移动 N 格"的命令，0 应当作 1
+	if ps == 0 {
+		ps = 1
+	}
 	action(ps)
 }
 
@@ -39,7 +43,7 @@ func (vt *virtualTerminal) cursorChange(params []rune, action func(ps int)) {
 func (vt *virtualTerminal) insertChar(params []rune) error {
 	row := vt.getCurrentRow()
 	ps := vt.getNumberOrDefault(params, 0, 1)
-	for i := 0; i < ps; i++ {
+	for range ps {
 		row.insert(space)
 	}
 	return nil
@@ -79,16 +83,16 @@ func (vt *virtualTerminal) cursorPrecedingLine(params []rune) error {
 	return vt.cursorUp(params)
 }
 
-// 光标移动到第n（默认1）列。
+// 光标移动到第n（默认1）列。CSI G 的列是 1-based。
 func (vt *virtualTerminal) cursorCharAbsolute(params []rune) error {
 	vt.cursorChange(params, func(ps int) {
-		vt.moveTo(ps, vt.rows)
+		vt.moveTo(ps-1, vt.rows)
 	})
 	return nil
 }
 
 // 光标移动到第n行、第m列。值从1开始，且默认为1（左上角）。
-// 例如CSI ;5H和CSI 1;5H含义相同；CSI 17;H、CSI 17H和CSI 17;1H三者含义相同。
+// 例如 CSI ;5H 和 CSI 1;5H 含义相同；CSI 17;H、CSI 17H 和 CSI 17;1H 三者含义相同。
 func (vt *virtualTerminal) cursorPosition(params []rune) error {
 	_, values := vt.parseCSIParams(params)
 
@@ -102,7 +106,7 @@ func (vt *virtualTerminal) cursorPosition(params []rune) error {
 		col = values[1]
 	}
 
-	vt.moveTo(col, row)
+	vt.moveTo(col-1, row-1)
 	return nil
 }
 
@@ -155,31 +159,38 @@ func (vt *virtualTerminal) eraseChars(params []rune) error {
 	return vt.deleteChars(params)
 }
 
-// Character Position Absolute  [column] (default = [rows,1])
+// Character Position Absolute  [column] (default = [rows,1])。CSI ` 列是 1-based。
 func (vt *virtualTerminal) charPosAbsolute(params []rune) error {
 	ps := vt.getNumberOrDefault(params, 0, 1)
-	vt.moveTo(ps, vt.rows)
+	vt.moveTo(ps-1, vt.rows)
 	return nil
 }
 
-// Character Position Relative  [columns] (default = [rows,col+1])
+// Character Position Relative (HPR, CSI Pn a)：光标向右移 N 列，行保持不变。
 func (vt *virtualTerminal) hPositionRelative(params []rune) error {
 	ps := vt.getNumberOrDefault(params, 0, 1)
+	if ps == 0 {
+		ps = 1
+	}
 	vt.move(ps, 0)
 	return nil
 }
 
-// 行定位绝对[ROW]（default = [1，列]）（VPA）。
+// 行定位绝对 (VPA)。CSI d 行是 1-based。
 func (vt *virtualTerminal) linePosAbsolute(params []rune) error {
 	ps := vt.getNumberOrDefault(params, 0, 1)
-	vt.setRow(ps)
+	vt.setRow(ps - 1)
 	return nil
 }
 
-// Line Position Relative  [rowList] (default = [rows+1,column])
+// Line Position Relative (VPR, CSI Pn e)：光标向下移 N 行，列保持不变。
+// 原实现 moveTo(0, ps) 是绝对定位且把 col 清零，与规范不符。
 func (vt *virtualTerminal) vPositionRelative(params []rune) error {
 	ps := vt.getNumberOrDefault(params, 0, 1)
-	vt.moveTo(0, ps)
+	if ps == 0 {
+		ps = 1
+	}
+	vt.move(0, ps)
 	return nil
 }
 
@@ -199,8 +210,7 @@ func (vt *virtualTerminal) parseCSIParams(params []rune) (isPrivate bool, values
 		return isPrivate, []int{}
 	}
 
-	parts := strings.Split(paramStr, ";")
-	for _, part := range parts {
+	for part := range strings.SplitSeq(paramStr, ";") {
 		if part == "" {
 			values = append(values, 0)
 			continue
@@ -215,23 +225,6 @@ func (vt *virtualTerminal) parseCSIParams(params []rune) (isPrivate bool, values
 	return isPrivate, values
 }
 
-/**
- * CSI Pm h  Set Mode (SM).
- *     Ps = 2  -> Keyboard Action Mode (AM).
- *     Ps = 4  -> insert Mode (IRM). Insert/Replace Mode
- *     Ps = 1 2  -> Send/receive (SRM).
- *     Ps = 2 0  -> Automatic Newline (LNM).
- *
- * @virtualTerminal: #P[Only IRM is supported.]    CSI SM    "Set Mode"  "CSI Pm h"  "Set various terminal modes."
- * Supported param values by SM:
- *
- * | Param | Action                                 | Support |
- * | ----- | -------------------------------------- | ------- |
- * | 2     | Keyboard Action Mode (KAM). Always on. | #N      |
- * | 4     | insert Mode (IRM).                     | #Y      |
- * | 12    | Send/receive (SRM). Always off.        | #N      |
- * | 20    | Automatic Newline (LNM). Always off.   | #N      |
- */
 func (vt *virtualTerminal) setMode(params []rune) error {
 	// 简化模式设置，只保留基本功能
 	return nil
@@ -243,10 +236,19 @@ func (vt *virtualTerminal) resetMode(params []rune) error {
 }
 
 // Set Scrolling Region [top;bottom] (default = full size of window) (DECSTBM), VT100.
+// 本实现没有真正的滚动区，仅按规范将光标移到 home (0,0)。
+// 原实现用 getNumberOrDefault 取第二个参数有 bug——它从指定 byte 偏移开始读，遇到分号立刻 break，永远拿不到 bottom。
 func (vt *virtualTerminal) setScrollRegion(params []rune) error {
-	top := vt.getNumberOrDefault(params, 0, 1)
-	bottom := vt.getNumberOrDefault(params, 1, 0)
-	if len(params) < 2 || bottom > len(vt.rowList) || bottom == 0 {
+	_, values := vt.parseCSIParams(params)
+	top := 1
+	bottom := 0
+	if len(values) > 0 && values[0] > 0 {
+		top = values[0]
+	}
+	if len(values) > 1 && values[1] > 0 {
+		bottom = values[1]
+	}
+	if bottom == 0 || bottom > len(vt.rowList) {
 		bottom = len(vt.rowList)
 	}
 	if bottom > top {
@@ -256,19 +258,22 @@ func (vt *virtualTerminal) setScrollRegion(params []rune) error {
 }
 
 func (vt *virtualTerminal) eraseBelow() error {
-	if vt.rows > 0 && vt.rows <= len(vt.rowList) {
-		// 保留当前行及以上的内容
-		vt.rowList = vt.rowList[:vt.rows]
+	// J 0：从光标到屏幕末尾——当前行光标右侧 + 当前行之后所有行
+	if vt.rows >= 0 && vt.rows < len(vt.rowList) {
+		vt.getCurrentRow().eraseRight()
+		vt.rowList = vt.rowList[:vt.rows+1]
 	}
 	return nil
 }
 
 func (vt *virtualTerminal) eraseAbove() error {
-	if vt.rows > 1 && vt.rows <= len(vt.rowList) {
-		// 保留当前行及以下的内容
-		vt.rowList = vt.rowList[vt.rows-1:]
-		// 重置行号
-		vt.rows = 1
+	// J 1：从屏幕开头到光标——当前行之前所有行 + 当前行光标左侧
+	if vt.rows >= 0 && vt.rows < len(vt.rowList) {
+		// 用空行替换当前行之前的内容，保留行号避免 cursor 失位
+		for i := 0; i < vt.rows; i++ {
+			vt.rowList[i] = &Row{data: []rune{}, index: 0}
+		}
+		vt.getCurrentRow().eraseLeft()
 	}
 	return nil
 }

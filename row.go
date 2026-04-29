@@ -18,10 +18,20 @@ func (r *Row) append(code rune) {
 		// 覆盖模式：替换当前位置的字符
 		r.data[r.index] = code
 	} else {
-		// 在末尾添加
+		// 光标超出当前行长度时先用空格补齐，避免字符落到错误的列
+		for len(r.data) < r.index {
+			r.data = append(r.data, space)
+		}
 		r.data = append(r.data, code)
 	}
 	r.index++
+}
+
+// 光标左移一格，不删除字符（标准 BS 语义）
+func (r *Row) moveLeft() {
+	if r.index > 0 {
+		r.index--
+	}
 }
 
 // 向下标位置插入字符
@@ -44,22 +54,6 @@ func (r *Row) delete(ps int) {
 		return
 	}
 	r.data = remove(r.data, r.index, ps)
-}
-
-// 删除指定位置的一个字符
-func (r *Row) deleteAt(pos int) {
-	if pos >= 0 && pos < len(r.data) {
-		r.data = append(r.data[:pos], r.data[pos+1:]...)
-	}
-}
-
-// 退格：删除光标前一个字符
-func (r *Row) backspace() {
-	if r.index > 0 && r.index <= len(r.data) {
-		// 删除 index-1 位置的字符
-		r.data = append(r.data[:r.index-1], r.data[r.index:]...)
-		r.index--
-	}
 }
 
 // 删除当前光标所在位置右侧的字符
