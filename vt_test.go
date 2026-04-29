@@ -174,8 +174,8 @@ func TestSetScrollRegionParsesBottom(t *testing.T) {
 
 func TestLineHandlerFiresOnLF(t *testing.T) {
 	var got []string
-	v := NewWithOptions(WithLineHandler(func(line string) {
-		got = append(got, line)
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		got = append(got, e.Line)
 	}))
 	v.Advance([]byte("first\nsecond\nthird"))
 	// "first" 和 "second" 各自被 LF 提交；"third" 没 LF 不会触发
@@ -189,8 +189,8 @@ func TestLineHandlerFiresOnLF(t *testing.T) {
 
 func TestLineHandlerCRLF(t *testing.T) {
 	var got []string
-	v := NewWithOptions(WithLineHandler(func(line string) {
-		got = append(got, line)
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		got = append(got, e.Line)
 	}))
 	v.Advance([]byte("ls -la\r\necho hi\r\n"))
 	if len(got) != 2 {
@@ -206,7 +206,7 @@ func TestLineHandlerMergesSoftWrap(t *testing.T) {
 	var got []string
 	v := NewWithOptions(
 		WithCols(10),
-		WithLineHandler(func(line string) { got = append(got, line) }),
+		WithLineHandler(func(e LineEvent) { got = append(got, e.Line) }),
 	)
 	long := strings.Repeat("x", 25)
 	v.Advance([]byte(long + "\n"))
@@ -223,7 +223,7 @@ func TestLineHandlerCalledAfterUnlock(t *testing.T) {
 	v := NewWithOptions()
 	var n atomic.Int32
 	var ref VirtualTerminal
-	v2 := NewWithOptions(WithLineHandler(func(line string) {
+	v2 := NewWithOptions(WithLineHandler(func(_ LineEvent) {
 		if n.Add(1) == 1 {
 			// 在 handler 里复用同一个虚拟终端写入
 			ref.Advance([]byte("inner\n"))
@@ -321,15 +321,14 @@ func TestIsAltScreen(t *testing.T) {
 }
 
 func TestLineHandlerSkipsAltScreenContent(t *testing.T) {
-	// 集成场景：alt screen 中即使出现 prompt-like 行，也应被 IsAltScreen 过滤
-	var v VirtualTerminal
+	// 集成场景：alt screen 中即使出现 prompt-like 行，也应被快照里的 IsAltScreen 过滤
 	var seen []string
 
-	v = NewWithOptions(WithLineHandler(func(line string) {
-		if IsAltScreen(v) {
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		if e.Modes.IsAltScreen() {
 			return
 		}
-		seen = append(seen, line)
+		seen = append(seen, e.Line)
 	}))
 
 	chunks := []string{
@@ -351,6 +350,30 @@ func TestLineHandlerSkipsAltScreenContent(t *testing.T) {
 	}
 }
 
+// TestLineEventModesSnapshot 验证：硬 LF 时携带的 Modes 是提交那一瞬间的快照，
+// 即使 Advance 在同一段输入里随后改变了模式（如 \r\n\x1b[?2004l），handler
+// 拿到的仍是提交时的状态。这是修 bracketed-paste prompt 识别 race 的关键能力。
+func TestLineEventModesSnapshot(t *testing.T) {
+	var events []LineEvent
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		events = append(events, e)
+	}))
+
+	// 模拟 bash readline 序列：先开 ?2004h、写 prompt + 命令、\r\n、再 ?2004l
+	v.Advance([]byte("\x1b[?2004hroot@host:~# ls -la\r\n\x1b[?2004l"))
+
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	if !events[0].Modes.IsSet(2004) {
+		t.Errorf("snapshot at commit should have ?2004 set; got false")
+	}
+	// 此时实时查询应该是 false（已经 ?2004l）
+	if v.IsPrivateModeSet(2004) {
+		t.Errorf("real-time mode should be cleared after ?2004l")
+	}
+}
+
 func TestPrivateModeResetCleared(t *testing.T) {
 	v := New()
 	v.Advance([]byte("\x1b[?2004h"))
@@ -365,8 +388,8 @@ func TestPrivateModeResetCleared(t *testing.T) {
 func TestLineHandlerIdentifiesCommandUnderPrompt(t *testing.T) {
 	// 模拟 bash：每条命令前都有 "user@host$ "，命令后有 LF + 输出 + LF
 	var lines []string
-	v := NewWithOptions(WithLineHandler(func(line string) {
-		lines = append(lines, line)
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		lines = append(lines, e.Line)
 	}))
 	v.Advance([]byte("user@host$ ls -la\r\nfile1\r\nfile2\r\nuser@host$ pwd\r\n/home/user\r\n"))
 

@@ -31,9 +31,34 @@ const (
 
 type inputHandler func(params []rune) error
 
-// LineHandler 在每次硬 LF 时回调一次，参数是被 LF 提交的"逻辑行"——
-// 如果开启了 WithCols 且该行是被软 wrap 拆开的，多段会被合并回完整字符串。
-type LineHandler func(line string)
+// LineEvent 是每次硬 LF 时 LineHandler 收到的事件。
+//
+// Modes 是该行被提交那一瞬间的私有模式快照副本——回调可以放心查询历史
+// 状态（例如 "提交此行时是否还在 bracketed paste ?2004h"），不会受到
+// Advance 处理后续字节时模式变化的影响。
+//
+// 直接查 vt.IsPrivateModeSet 拿到的是回调时刻的最新值，对很多审计/识别
+// 场景是错的——一段输入里 \r\n 之后通常紧跟 ?2004l（关闭 readline），
+// 解锁回调时已经看不到 ?2004h 了。
+type LineEvent struct {
+	Line  string
+	Modes ModeSnapshot
+}
+
+// ModeSnapshot 是一组私有模式状态的快照副本。零值表示空快照（所有模式未设置）。
+type ModeSnapshot map[int]bool
+
+// IsSet 查询私有模式 n 是否在快照中为 true。
+func (s ModeSnapshot) IsSet(n int) bool { return s[n] }
+
+// IsAltScreen 返回快照里是否处于 alt screen（?1049 / ?1047 / ?47 任一为真）。
+func (s ModeSnapshot) IsAltScreen() bool {
+	return s[1049] || s[1047] || s[47]
+}
+
+// LineHandler 在每次硬 LF 时回调一次。参数是被提交的"逻辑行"事件——
+// 多段软 wrap 行会被合并为一条逻辑 Line；Modes 是提交时刻的私有模式快照。
+type LineHandler func(LineEvent)
 
 type VirtualTerminal interface {
 	Advance(p []byte)
@@ -101,9 +126,15 @@ type virtualTerminal struct {
 	privateModes  map[int]bool
 
 	lineHandler  LineHandler
-	pendingLines []string // commitLogicalLine 在锁内追加，Advance 解锁后回放给 lineHandler
+	pendingLines []pendingLine // commitLogicalLine 在锁内追加，Advance 解锁后回放给 lineHandler
 
 	logger *log.Logger
+}
+
+// pendingLine 记录一条尚未交给 LineHandler 的提交事件。
+type pendingLine struct {
+	line  string
+	modes ModeSnapshot
 }
 
 // IsAltScreen 检查终端是否处于 alt screen 缓冲区。
@@ -237,8 +268,8 @@ func (vt *virtualTerminal) handleC0Sequence(code rune) {
 	}
 }
 
-// commitLogicalLine 在硬 LF 触发时把当前行（含其连续的软 wrap 上游行）拼成一条逻辑行，
-// 暂存到 pendingLines 等 Advance 解锁后再交给 lineHandler。
+// commitLogicalLine 在硬 LF 触发时把当前行（含其连续的软 wrap 上游行）拼成一条
+// 逻辑行，连同提交时刻的 mode 快照一起暂存到 pendingLines，等 Advance 解锁后回放。
 func (vt *virtualTerminal) commitLogicalLine() {
 	if vt.lineHandler == nil {
 		return
@@ -255,7 +286,14 @@ func (vt *virtualTerminal) commitLogicalLine() {
 	for i := start; i <= end; i++ {
 		b.WriteString(vt.rowList[i].String())
 	}
-	vt.pendingLines = append(vt.pendingLines, b.String())
+	snap := make(ModeSnapshot, len(vt.privateModes))
+	for k, v := range vt.privateModes {
+		snap[k] = v
+	}
+	vt.pendingLines = append(vt.pendingLines, pendingLine{
+		line:  b.String(),
+		modes: snap,
+	})
 }
 
 func (vt *virtualTerminal) log(v ...any) {
@@ -312,8 +350,8 @@ func (vt *virtualTerminal) Advance(p []byte) {
 
 	// 回调在锁外执行，避免 handler 阻塞影响其它读写
 	if handler != nil {
-		for _, line := range pending {
-			handler(line)
+		for _, pl := range pending {
+			handler(LineEvent{Line: pl.line, Modes: pl.modes})
 		}
 	}
 }
