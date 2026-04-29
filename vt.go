@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"unicode/utf8"
 )
@@ -30,10 +31,16 @@ const (
 
 type inputHandler func(params []rune) error
 
+// LineHandler 在每次硬 LF 时回调一次，参数是被 LF 提交的"逻辑行"——
+// 如果开启了 WithCols 且该行是被软 wrap 拆开的，多段会被合并回完整字符串。
+type LineHandler func(line string)
+
 type VirtualTerminal interface {
 	Advance(p []byte)
 	Output() []string
 	Reset()
+	// IsPrivateModeSet 查询 DEC 私有模式（如 25 光标可见、1049 alt screen、2004 bracketed paste）。
+	IsPrivateModeSet(n int) bool
 }
 
 // Opt is a function that configures a virtualTerminal.
@@ -46,6 +53,25 @@ func WithLogger(logger *log.Logger) Opt {
 	}
 }
 
+// WithCols 设置终端列宽。开启后字符越过列宽会触发软 wrap，
+// 但 LineHandler 仍按硬 LF 切分逻辑行——多段软 wrap 会被合并。
+// 默认 0 表示不限制（不 wrap，每行可无限拉长）。
+func WithCols(cols int) Opt {
+	return func(vt *virtualTerminal) {
+		if cols > 0 {
+			vt.cols = cols
+		}
+	}
+}
+
+// WithLineHandler 注册行提交回调。每次硬 LF 触发一次，
+// 回调在 Advance 释放内部锁之后同步执行，避免在锁内回调阻塞。
+func WithLineHandler(h LineHandler) Opt {
+	return func(vt *virtualTerminal) {
+		vt.lineHandler = h
+	}
+}
+
 func New() VirtualTerminal {
 	return NewWithOptions()
 }
@@ -53,6 +79,7 @@ func New() VirtualTerminal {
 func NewWithOptions(opts ...Opt) VirtualTerminal {
 	vt := &virtualTerminal{
 		inputHandlers: make(map[byte]inputHandler),
+		privateModes:  make(map[int]bool),
 		rowList:       make([]*Row, 0),
 		rows:          0,
 		logger:        nil,
@@ -68,9 +95,28 @@ type virtualTerminal struct {
 	sync.RWMutex
 	rowList []*Row // 行数据
 	rows    int    // 当前行索引（0-based）
+	cols    int    // 列宽，0 表示不限
 
 	inputHandlers map[byte]inputHandler
-	logger        *log.Logger
+	privateModes  map[int]bool
+
+	lineHandler  LineHandler
+	pendingLines []string // commitLogicalLine 在锁内追加，Advance 解锁后回放给 lineHandler
+
+	logger *log.Logger
+}
+
+// IsAltScreen 检查终端是否处于 alt screen 缓冲区。
+// vim、nano、less、man、tmux、htop 等 TUI 应用进入时会发送 CSI ?1049h
+// （或较老的 ?1047h、?47h）切到 alt screen 绘制全屏 UI。
+//
+// 在 LineHandler 中调用时返回的是查询时刻的状态，可能比该 line 的 LF 提交
+// 时刻稍晚——但 TUI 进入/退出与 shell prompt 通常分布在不同输入 chunk，
+// 实际场景中该 race 不会让 alt screen 内的内容被误识别成 shell 命令。
+func IsAltScreen(vt VirtualTerminal) bool {
+	return vt.IsPrivateModeSet(1049) ||
+		vt.IsPrivateModeSet(1047) ||
+		vt.IsPrivateModeSet(47)
 }
 
 func (vt *virtualTerminal) addCsiHandler(b byte, handler inputHandler) {
@@ -180,7 +226,8 @@ func (vt *virtualTerminal) handleC0Sequence(code rune) {
 		vt.getCurrentRow().moveLeft()
 	case _HT: // \t 这里简化为输出一个 TAB 字符
 		vt.appendCharacter(_HT)
-	case _LF, _VT, _FF: // \n / \v / \f 都向下移动一行
+	case _LF, _VT, _FF: // \n / \v / \f 都向下移动一行——硬换行，提交逻辑行
+		vt.commitLogicalLine()
 		vt.moveDown(1)
 		vt.setCol(0)
 	case _CR: // \r 回到行首
@@ -188,6 +235,27 @@ func (vt *virtualTerminal) handleC0Sequence(code rune) {
 	case _SO, _SI: // 字符集 G1/G0 切换，本实现不区分字符集
 	case _DEL: // VT 终端通常忽略 DEL；现代终端的退格键发送的是 BS 或 CSI ~。
 	}
+}
+
+// commitLogicalLine 在硬 LF 触发时把当前行（含其连续的软 wrap 上游行）拼成一条逻辑行，
+// 暂存到 pendingLines 等 Advance 解锁后再交给 lineHandler。
+func (vt *virtualTerminal) commitLogicalLine() {
+	if vt.lineHandler == nil {
+		return
+	}
+	if vt.rows < 0 || vt.rows >= len(vt.rowList) {
+		return
+	}
+	end := vt.rows
+	start := end
+	for start > 0 && vt.rowList[start].wrappedFromPrev {
+		start--
+	}
+	var b strings.Builder
+	for i := start; i <= end; i++ {
+		b.WriteString(vt.rowList[i].String())
+	}
+	vt.pendingLines = append(vt.pendingLines, b.String())
 }
 
 func (vt *virtualTerminal) log(v ...any) {
@@ -222,14 +290,38 @@ func (vt *virtualTerminal) getNumberOrDefault(params []rune, index, _default int
 }
 
 func (vt *virtualTerminal) appendCharacter(code rune) {
-	currentRow := vt.getCurrentRow()
-	currentRow.append(code)
+	if vt.cols > 0 {
+		row := vt.getCurrentRow()
+		if row.index >= vt.cols {
+			// 软 wrap：进入下一物理行，并标记为 wrappedFromPrev，让 commitLogicalLine 能合并回去
+			vt.moveDown(1)
+			vt.setCol(0)
+			vt.getCurrentRow().wrappedFromPrev = true
+		}
+	}
+	vt.getCurrentRow().append(code)
 }
 
 func (vt *virtualTerminal) Advance(p []byte) {
 	vt.Lock()
-	defer vt.Unlock()
 	vt.advance(p)
+	pending := vt.pendingLines
+	vt.pendingLines = nil
+	handler := vt.lineHandler
+	vt.Unlock()
+
+	// 回调在锁外执行，避免 handler 阻塞影响其它读写
+	if handler != nil {
+		for _, line := range pending {
+			handler(line)
+		}
+	}
+}
+
+func (vt *virtualTerminal) IsPrivateModeSet(n int) bool {
+	vt.RLock()
+	defer vt.RUnlock()
+	return vt.privateModes[n]
 }
 
 func (vt *virtualTerminal) advance(inputs []byte) {
@@ -278,4 +370,6 @@ func (vt *virtualTerminal) Reset() {
 	}
 	vt.rowList = make([]*Row, 0)
 	vt.rows = 0
+	vt.privateModes = make(map[int]bool)
+	vt.pendingLines = nil
 }

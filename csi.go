@@ -225,13 +225,45 @@ func (vt *virtualTerminal) parseCSIParams(params []rune) (isPrivate bool, values
 	return isPrivate, values
 }
 
+/**
+ * CSI Pm h  Set Mode (SM).
+ *     Ps = 2  -> Keyboard Action Mode (AM).
+ *     Ps = 4  -> insert Mode (IRM). Insert/Replace Mode
+ *     Ps = 1 2  -> Send/receive (SRM).
+ *     Ps = 2 0  -> Automatic Newline (LNM).
+ *
+ * @virtualTerminal: #P[Only IRM is supported.]    CSI SM    "Set Mode"  "CSI Pm h"  "Set various terminal modes."
+ * Supported param values by SM:
+ *
+ * | Param | Action                                 | Support |
+ * | ----- | -------------------------------------- | ------- |
+ * | 2     | Keyboard Action Mode (KAM). Always on. | #N      |
+ * | 4     | insert Mode (IRM).                     | #Y      |
+ * | 12    | Send/receive (SRM). Always off.        | #N      |
+ * | 20    | Automatic Newline (LNM). Always off.   | #N      |
+ */
+// setMode 处理 CSI Pm h。私有模式（带 ?，如 ?2004 bracketed paste、?1049 alt screen、?25 cursor）
+// 仅记录到 privateModes，由调用方通过 IsPrivateModeSet 查询。ANSI 标准模式当前忽略。
 func (vt *virtualTerminal) setMode(params []rune) error {
-	// 简化模式设置，只保留基本功能
+	isPrivate, values := vt.parseCSIParams(params)
+	if !isPrivate {
+		return nil
+	}
+	for _, v := range values {
+		vt.privateModes[v] = true
+	}
 	return nil
 }
 
+// resetMode 处理 CSI Pm l——私有模式从 privateModes 中删除；ANSI 标准模式当前忽略。
 func (vt *virtualTerminal) resetMode(params []rune) error {
-	// 简化模式重置，只保留基本功能
+	isPrivate, values := vt.parseCSIParams(params)
+	if !isPrivate {
+		return nil
+	}
+	for _, v := range values {
+		delete(vt.privateModes, v)
+	}
 	return nil
 }
 

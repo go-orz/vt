@@ -3,6 +3,9 @@ package vt
 type Row struct {
 	data  []rune // 当前行
 	index int
+	// wrappedFromPrev 标记本行是 cols 软折行从上一行延续而来——对 LineHandler 而言，
+	// 这一行与它之前的连续 wrappedFromPrev 行属于同一条"逻辑行"。
+	wrappedFromPrev bool
 }
 
 func (r *Row) setIndex(index int) {
