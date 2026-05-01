@@ -68,15 +68,14 @@ func (r *Row) eraseRight() {
 
 // 删除当前光标所在位置左侧的字符（包含光标位置）
 func (r *Row) eraseLeft() {
-	if r.index > 0 {
+	if r.index > 0 && r.index < len(r.data) {
 		// 保留光标位置之后的内容
 		r.data = r.data[r.index:]
-		r.index = 0
 	} else {
-		// 如果光标在开头，清空整行
+		// 光标在开头，或已超过行尾——整行清空
 		r.data = []rune{}
-		r.index = 0
 	}
+	r.index = 0
 }
 
 func (r *Row) String() string {

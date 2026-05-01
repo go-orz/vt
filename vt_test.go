@@ -110,6 +110,20 @@ func TestEraseAboveClearsCursorRowLeft(t *testing.T) {
 	}
 }
 
+func TestEraseLeftCursorPastRowEndDoesNotPanic(t *testing.T) {
+	// 复现：先把光标定位到空行的中段（行 data 长度为 0、index>0），再发 EL 1
+	// 老实现里 r.data[r.index:] 会触发 slice bounds out of range。
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("eraseLeft panicked when cursor past row end: %v", r)
+		}
+	}()
+	v := New()
+	v.Advance([]byte("\x1b[1;6H")) // 移到第 1 行第 6 列，当前行 data 仍为空
+	v.Advance([]byte("\x1b[1K"))   // EL 1：从行首到光标
+	_ = v.Output()
+}
+
 func TestVPositionRelativeIsRelative(t *testing.T) {
 	// VPR (CSI Pn e) 应该向下移 N 行且保持 col。
 	// 写 "abc"，光标在第 0 行第 3 列；CSI 1e 后应到第 1 行第 3 列；写 X 应得到 "abc\n   X"
@@ -144,8 +158,8 @@ func TestHPositionRelativeIsRelative(t *testing.T) {
 func TestCursorMoveZeroParamTreatedAsOne(t *testing.T) {
 	// CSI 0A 在 VT100 规范中应当作 CSI 1A
 	v := New()
-	v.Advance([]byte("a\nb"))      // 第 0 行 "a"，第 1 行 "b"，光标在第 1 行第 1 列
-	v.Advance([]byte("\x1b[0A"))    // CSI 0A：上移，按规范当 1
+	v.Advance([]byte("a\nb"))    // 第 0 行 "a"，第 1 行 "b"，光标在第 1 行第 1 列
+	v.Advance([]byte("\x1b[0A")) // CSI 0A：上移，按规范当 1
 	v.Advance([]byte("X"))
 	out := v.Output()
 	// 光标应在第 0 行第 1 列，覆盖时把空格补到列 1（"a" 之后无字符），再写 X
@@ -391,9 +405,9 @@ func TestOSCHandlerCapturesPayload(t *testing.T) {
 	}))
 
 	// 三种终止符（BEL / ST / ESC \）都应当工作
-	v.Advance([]byte("\x1b]1337;CurrentDir=/tmp\x07"))                        // BEL
-	v.Advance([]byte("\x1b]7;file://host/var/log\x9c"))                       // ST
-	v.Advance([]byte("\x1b]0;window title\x1b\\"))                            // ESC \
+	v.Advance([]byte("\x1b]1337;CurrentDir=/tmp\x07"))  // BEL
+	v.Advance([]byte("\x1b]7;file://host/var/log\x9c")) // ST
+	v.Advance([]byte("\x1b]0;window title\x1b\\"))      // ESC \
 
 	want := []string{
 		"1337;CurrentDir=/tmp",
