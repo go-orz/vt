@@ -48,11 +48,11 @@ func TestESC_CharsetSelectIsConsumed(t *testing.T) {
 	mustEqualLines(t, got, []string{"hi"})
 }
 
-func TestESC_SaveRestoreCursorIsConsumed(t *testing.T) {
-	// ESC 7 / ESC 8 是 0 参数 ESC 序列，应被消费而不会把 7/8 当成屏幕字符。
-	// 注意：本实现未真的保存/恢复光标，只验证序列字节被吃掉。
+func TestESC_SaveRestoreCursor(t *testing.T) {
+	// ESC 7 (DECSC) 保存光标、ESC 8 (DECRC) 恢复：
+	// "a" 后保存（col 1），写 "b"，恢复后写 "c" 应覆盖掉 "b"
 	got := feed(t, "a\x1b7b\x1b8c")
-	mustEqualLines(t, got, []string{"abc"})
+	mustEqualLines(t, got, []string{"ac"})
 }
 
 func TestBackspaceMovesCursorWithoutDeleting(t *testing.T) {
@@ -484,4 +484,117 @@ func TestAdvanceConcurrentSafe(t *testing.T) {
 	}
 	wg.Wait()
 	_ = v.Output()
+}
+
+// ---------- 跨 Advance 分包（TCP 分块场景）----------
+
+func TestSplitChunkCSI(t *testing.T) {
+	// CSI 序列被切成两个 Advance：参数和 final byte 分属两个 chunk。
+	// 解析状态必须跨调用保持——ESC[2D 是"左移2格"，'b' 应写到行首覆盖 'a'。
+	v := New()
+	v.Advance([]byte("a\x1b[2"))
+	v.Advance([]byte("Db"))
+	mustEqualLines(t, v.Output(), []string{"b"})
+}
+
+func TestSplitChunkOSC(t *testing.T) {
+	// OSC payload 被切成两个 Advance：payload 应完整拼出，不污染屏幕
+	var got []string
+	v := NewWithOptions(WithOSCHandler(func(payload string) { got = append(got, payload) }))
+	v.Advance([]byte("\x1b]0;ti"))
+	v.Advance([]byte("tle\x07after"))
+	if len(got) != 1 || got[0] != "0;title" {
+		t.Errorf("osc payload: got %q, want [0;title]", got)
+	}
+	mustEqualLines(t, v.Output(), []string{"after"})
+}
+
+func TestSplitChunkDCS(t *testing.T) {
+	// DCS 序列（如 tmux 的 ESC Ptmux;...ESC\）跨 chunk 应被完整消费
+	v := New()
+	v.Advance([]byte("a\x1bPtmux;"))
+	v.Advance([]byte("stuff\x1b\\b"))
+	mustEqualLines(t, v.Output(), []string{"ab"})
+}
+
+// ---------- 修复回归：ECH / CNL / CPL / EL1 / ESC D E ----------
+
+func TestECHOverwritesWithSpaces(t *testing.T) {
+	// ECH (CSI X) 用空格覆盖，不删除移位："abcdef" 光标到第2列，ECH 2 → "a  def"
+	v := New()
+	v.Advance([]byte("abcdef"))
+	v.Advance([]byte("\x1b[1;2H"))
+	v.Advance([]byte("\x1b[2X"))
+	mustEqualLines(t, v.Output(), []string{"a  def"})
+}
+
+func TestCNLReturnsToColumnZero(t *testing.T) {
+	// 在已有内容的行之间跳转时，CNL 必须回到行首
+	v := New()
+	v.Advance([]byte("abc\ndef"))
+	v.Advance([]byte("\x1b[1A")) // 上移到第 0 行，col 仍是 3
+	v.Advance([]byte("\x1b[1E")) // CNL：下一行行首
+	v.Advance([]byte("X"))
+	mustEqualLines(t, v.Output(), []string{"abc", "Xef"})
+}
+
+func TestCPLReturnsToColumnZero(t *testing.T) {
+	v := New()
+	v.Advance([]byte("abc\ndef"))
+	v.Advance([]byte("\x1b[1F")) // CPL：上一行行首
+	v.Advance([]byte("X"))
+	mustEqualLines(t, v.Output(), []string{"Xbc", "def"})
+}
+
+func TestEraseLeftIncludesCursor(t *testing.T) {
+	// EL 1 擦除范围含光标位："abcdef" 光标在第 2 列('c')，EL1 → "def"
+	v := New()
+	v.Advance([]byte("abcdef"))
+	v.Advance([]byte("\x1b[1;3H"))
+	v.Advance([]byte("\x1b[1K"))
+	mustEqualLines(t, v.Output(), []string{"def"})
+}
+
+func TestESCIndexIsHardLineBreak(t *testing.T) {
+	// ESC D (IND) 是硬换行，应触发 LineHandler 且不回行首
+	var got []string
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) { got = append(got, e.Line) }))
+	v.Advance([]byte("ab\x1bDcd"))
+	if len(got) != 1 || got[0] != "ab" {
+		t.Errorf("line events: got %q, want [ab]", got)
+	}
+	mustEqualLines(t, v.Output(), []string{"ab", "cd"})
+}
+
+func TestESCNextLineCommitsAndCr(t *testing.T) {
+	// ESC E (NEL)：硬换行 + 回行首
+	var got []string
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) { got = append(got, e.Line) }))
+	v.Advance([]byte("ab\x1bEcd"))
+	if len(got) != 1 || got[0] != "ab" {
+		t.Errorf("line events: got %q, want [ab]", got)
+	}
+	mustEqualLines(t, v.Output(), []string{"ab", "cd"})
+}
+
+func TestESCRISFullReset(t *testing.T) {
+	// ESC c (RIS) 完全复位：屏幕 + 私有模式都清掉
+	v := New()
+	v.Advance([]byte("\x1b[?2004hhello"))
+	v.Advance([]byte("\x1bc"))
+	if v.IsPrivateModeSet(2004) {
+		t.Errorf("RIS should clear private modes")
+	}
+	if out := v.Output(); len(out) != 0 {
+		t.Errorf("RIS should clear screen; got %q", out)
+	}
+}
+
+func TestDCHAndICHParamZeroIsOne(t *testing.T) {
+	// 参数 0 按规范视为 1
+	v := New()
+	v.Advance([]byte("abc"))
+	v.Advance([]byte("\x1b[1;2H")) // 光标在 'b'
+	v.Advance([]byte("\x1b[0P"))   // DCH 0 → 1：删掉 'b' → "ac"
+	mustEqualLines(t, v.Output(), []string{"ac"})
 }

@@ -1,13 +1,15 @@
 package vt
 
 import (
-	"bytes"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
+
+	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/ansi/parser"
 )
 
 const (
@@ -22,12 +24,13 @@ const (
 	_SI  rune = 0x0f // Shift In
 
 	_ESC rune = 0x1b // Escape (Caret = ^[, C = \e)
-	_DEL rune = 0x7f // Delete (Caret = ^?)
-
-	_ST rune = 0x9c // String Terminator
 
 	space rune = 0x20 // 空格
 )
+
+// maxStringDataSize 限制单个 OSC/DCS 等 string sequence 的 payload 大小，
+// 防止畸形超长序列撑爆内存。1MB 远超正常 OSC（标题、CurrentDir 等）的体积。
+const maxStringDataSize = 1024 * 1024
 
 type inputHandler func(params []rune) error
 
@@ -135,6 +138,7 @@ func NewWithOptions(opts ...Opt) VirtualTerminal {
 		opt(vt)
 	}
 	vt.initCsiHandler()
+	vt.initParser()
 	return vt
 }
 
@@ -144,6 +148,8 @@ type virtualTerminal struct {
 	rows    int    // 当前行索引（0-based）
 	cols    int    // 列宽，0 表示不限
 
+	parser *ansi.Parser // 跨 Advance 持久保存解析状态的 ANSI 字节流状态机
+
 	inputHandlers map[byte]inputHandler
 	privateModes  map[int]bool
 
@@ -151,6 +157,10 @@ type virtualTerminal struct {
 	pendingLines []pendingLine // commitLogicalLine 在锁内追加，Advance 解锁后回放给 lineHandler
 
 	oscHandler OSCHandler
+
+	hasSavedCursor bool // ESC 7 保存的光标状态
+	savedRow       int
+	savedCol       int
 
 	logger *log.Logger
 }
@@ -201,102 +211,57 @@ func (vt *virtualTerminal) newRow() *Row {
 	return row
 }
 
-func (vt *virtualTerminal) handleSequence(inputs []byte) []byte {
-	if len(inputs) == 0 {
-		return inputs
-	}
-	code, size := utf8.DecodeRune(inputs)
-	inputs = inputs[size:]
-	switch code {
-	case '[': // CSI - 控制序列导入器（Control Sequence Introducer）
-		inputs = vt.handleCSISequence(inputs)
-	case ']': // OSC – 操作系统命令（Operating System Command）
-		inputs = vt.handleOSCSequence(inputs)
-	case 'P', 'X', '^', '_': // DCS / SOS / PM / APC - 与 OSC 一样按字符串处理
-		inputs = vt.handleStringSequence(inputs)
-	case '(', ')', '*', '+', '-', '.', '/': // 字符集选择（G0/G1/G2/G3），再吃掉一个 final byte
-		if len(inputs) > 0 {
-			inputs = inputs[1:]
-		}
-	case ' ', '#', '%': // 各类两字节 ESC 序列（如 ESC SP F、ESC # 8）
-		if len(inputs) > 0 {
-			inputs = inputs[1:]
-		}
-	default:
-		// 其它单字节 ESC 序列（7 8 = > D E M c N O 等）已在上面 size 步骤里被吃掉，无需额外处理
-	}
-	return inputs
-}
-
-func (vt *virtualTerminal) handleCSISequence(p []byte) []byte {
-	index := bytes.IndexFunc(p, func(r rune) bool {
-		return isCSISequence(r)
+// initParser 建立 ANSI 字节流状态机。解析状态跨 Advance 调用持久保存，
+// 因此被 TCP 分包截断的 CSI/OSC/DCS 序列能在下一个 chunk 到达后正确完成。
+func (vt *virtualTerminal) initParser() {
+	vt.parser = ansi.NewParser()
+	vt.parser.SetParamsSize(parser.MaxParamsSize)
+	vt.parser.SetDataSize(maxStringDataSize)
+	vt.parser.SetHandler(ansi.Handler{
+		Print:     vt.handlePrint,
+		Execute:   vt.handleExecute,
+		HandleCsi: vt.handleCsi,
+		HandleEsc: vt.handleEsc,
+		HandleOsc: vt.handleOsc,
+		// DCS / SOS / PM / APC 对行识别无用，解析器会正确消费到终止符，直接丢弃
+		HandleDcs: func(ansi.Cmd, ansi.Params, []byte) {},
+		HandleSos: func([]byte) {},
+		HandlePm:  func([]byte) {},
+		HandleApc: func([]byte) {},
 	})
-	if index > -1 {
-		b := p[index]
-		handler, ok := vt.inputHandlers[b]
-		if ok {
-			params := []rune(string(p[:index]))
-			if err := handler(params); err != nil {
-				vt.log(fmt.Sprintf("handle csi sequence err %v", err.Error()))
+}
+
+// csiParams 把解析器产出的结构化参数还原为现有 CSI handler 使用的
+// []rune 参数串：私有标记前缀（如 '?'）+ 分号分隔的参数。
+// 子参数（冒号分隔）按 x/ansi 的方式还原，现有 handler 均不使用子参数。
+func csiParams(cmd ansi.Cmd, params ansi.Params) []rune {
+	var b strings.Builder
+	if p := cmd.Prefix(); p != 0 {
+		b.WriteByte(p)
+	}
+	params.ForEach(0, func(i, param int, more bool) {
+		if i > 0 {
+			if more {
+				b.WriteByte(':')
+			} else {
+				b.WriteByte(';')
 			}
-		} else {
-			vt.log(fmt.Sprintf("no match input handler for %q %v", b, b))
 		}
-		return p[index+1:]
-	}
-
-	return p
+		b.WriteString(strconv.Itoa(param))
+	})
+	return []rune(b.String())
 }
 
-// handleStringSequence 消费一段以 BEL / ST(0x9c) / ESC \ 终止的"字符串型"控制序列（OSC/DCS/SOS/PM/APC）。
-// 之前的实现只识别 ST，遇到 xterm 风格的 BEL 终止就会把后续所有输出全部吞掉。
-func (vt *virtualTerminal) handleStringSequence(p []byte) []byte {
-	for i := range len(p) {
-		switch p[i] {
-		case byte(_BEL), byte(_ST):
-			return p[i+1:]
-		case byte(_ESC):
-			// ESC \ 也是终止符
-			if i+1 < len(p) && p[i+1] == '\\' {
-				return p[i+2:]
-			}
-			// 其它 ESC 视为异常终止，把控制权交还给主循环
-			return p[i:]
-		}
+func (vt *virtualTerminal) handlePrint(r rune) {
+	if r == utf8.RuneError {
+		vt.log("无效的UTF-8字符")
+		return
 	}
-	// 没有任何终止符——可能是被截断的输入；保守地丢弃剩余字节，避免污染屏幕
-	return nil
+	vt.appendCharacter(r)
 }
 
-// handleOSCSequence 消费一个 OSC 序列。与通用 handleStringSequence 不同：
-// 在调用 oscHandler 时把 ESC ] 与终止符之间的 payload 文本传出去，便于
-// 调用方解析 iTerm2 风格 1337 / VTE 风格 7 等扩展。
-func (vt *virtualTerminal) handleOSCSequence(p []byte) []byte {
-	for i := range len(p) {
-		switch p[i] {
-		case byte(_BEL), byte(_ST):
-			vt.fireOSC(p[:i])
-			return p[i+1:]
-		case byte(_ESC):
-			if i+1 < len(p) && p[i+1] == '\\' {
-				vt.fireOSC(p[:i])
-				return p[i+2:]
-			}
-			return p[i:]
-		}
-	}
-	return nil
-}
-
-func (vt *virtualTerminal) fireOSC(payload []byte) {
-	if vt.oscHandler != nil && len(payload) > 0 {
-		vt.oscHandler(string(payload))
-	}
-}
-
-func (vt *virtualTerminal) handleC0Sequence(code rune) {
-	switch code {
+func (vt *virtualTerminal) handleExecute(b byte) {
+	switch rune(b) {
 	case _BEL: // \a 响铃，无副作用
 	case _BS: // \b BS 在 VT 语义里只是"光标左移一格"，并不删除字符。
 		// bash 的 readline 重绘提示符时常用 BS + 空格擦除残留字符，如果这里直接删字符会让行内容丢失。
@@ -309,9 +274,61 @@ func (vt *virtualTerminal) handleC0Sequence(code rune) {
 		vt.setCol(0)
 	case _CR: // \r 回到行首
 		vt.setCol(0)
-	case _SO, _SI: // 字符集 G1/G0 切换，本实现不区分字符集
-	case _DEL: // VT 终端通常忽略 DEL；现代终端的退格键发送的是 BS 或 CSI ~。
+	default:
+		// SO/SI/DEL 及其它 C0/C1 控制码无副作用
 	}
+}
+
+func (vt *virtualTerminal) handleCsi(cmd ansi.Cmd, params ansi.Params) {
+	handler, ok := vt.inputHandlers[cmd.Final()]
+	if !ok {
+		vt.log(fmt.Sprintf("no match csi handler for %q", string(cmd.Final())))
+		return
+	}
+	if err := handler(csiParams(cmd, params)); err != nil {
+		vt.log(fmt.Sprintf("handle csi sequence err %v", err.Error()))
+	}
+}
+
+// handleEsc 处理非 CSI 的 ESC 序列。带中间字节的序列（字符集选择 ESC ( B、
+// ESC SP F、ESC # 8 等）没有屏幕副作用，直接消费。
+func (vt *virtualTerminal) handleEsc(cmd ansi.Cmd) {
+	if cmd.Intermediate() != 0 {
+		return
+	}
+	switch cmd.Final() {
+	case '7': // DECSC 保存光标位置
+		vt.hasSavedCursor = true
+		vt.savedRow = vt.rows
+		vt.savedCol = vt.getCurrentRow().index
+	case '8': // DECRC 恢复光标位置
+		if vt.hasSavedCursor {
+			vt.moveTo(vt.savedCol, vt.savedRow)
+		}
+	case 'D': // IND 索引：下移一行，等同 LF（但不回行首），属于硬换行
+		vt.commitLogicalLine()
+		vt.moveDown(1)
+	case 'E': // NEL 下一行：下移一行并回到行首
+		vt.commitLogicalLine()
+		vt.moveDown(1)
+		vt.setCol(0)
+	case 'M': // RI 反向索引：上移一行
+		vt.moveUp(1)
+	case 'c': // RIS 完全复位：等价 Reset（屏幕 + 私有模式 + 保存的光标）
+		vt.resetScreenLocked()
+		vt.privateModes = make(map[int]bool)
+		vt.hasSavedCursor = false
+	}
+}
+
+// handleOsc 回调 OSCHandler。解析器给出的 data 是 ESC ] 与终止符之间的
+// 完整 payload（含前导 cmd，如 "1337;CurrentDir=/tmp"），与手写解析层
+// 时代的 payload 格式一致，直接透传。
+func (vt *virtualTerminal) handleOsc(_ int, data []byte) {
+	if vt.oscHandler == nil || len(data) == 0 {
+		return
+	}
+	vt.oscHandler(string(data))
 }
 
 // commitLogicalLine 在硬 LF 触发时把当前行（含其连续的软 wrap 上游行）拼成一条
@@ -353,20 +370,20 @@ func (vt *virtualTerminal) getNumberOrDefault(params []rune, index, _default int
 		return _default
 	}
 
-	var numStr string
+	var numStr strings.Builder
 	for i := index; i < len(params); i++ {
 		if params[i] >= '0' && params[i] <= '9' {
-			numStr += string(params[i])
+			numStr.WriteString(string(params[i]))
 		} else {
 			break
 		}
 	}
 
-	if numStr == "" {
+	if numStr.String() == "" {
 		return _default
 	}
 
-	if num, err := strconv.Atoi(numStr); err == nil {
+	if num, err := strconv.Atoi(numStr.String()); err == nil {
 		return num
 	}
 
@@ -388,7 +405,9 @@ func (vt *virtualTerminal) appendCharacter(code rune) {
 
 func (vt *virtualTerminal) Advance(p []byte) {
 	vt.Lock()
-	vt.advance(p)
+	for i := range p {
+		vt.parser.Advance(p[i])
+	}
 	pending := vt.pendingLines
 	vt.pendingLines = nil
 	handler := vt.lineHandler
@@ -408,28 +427,6 @@ func (vt *virtualTerminal) IsPrivateModeSet(n int) bool {
 	return vt.privateModes[n]
 }
 
-func (vt *virtualTerminal) advance(inputs []byte) {
-	for len(inputs) > 0 {
-		code, size := utf8.DecodeRune(inputs)
-		if code == utf8.RuneError && size == 1 {
-			vt.log("无效的UTF-8字符")
-			inputs = inputs[1:]
-			continue
-		}
-
-		inputs = inputs[size:]
-		if _ESC == code {
-			inputs = vt.handleSequence(inputs)
-			continue
-		}
-		if isC0Sequence(code) {
-			vt.handleC0Sequence(code)
-		} else {
-			vt.appendCharacter(code)
-		}
-	}
-}
-
 func (vt *virtualTerminal) Output() []string {
 	vt.RLock()
 	defer vt.RUnlock()
@@ -447,6 +444,7 @@ func (vt *virtualTerminal) Reset() {
 
 	vt.resetScreenLocked()
 	vt.privateModes = make(map[int]bool)
+	vt.hasSavedCursor = false
 }
 
 // ResetScreen 仅重置屏幕状态——保留私有模式（如 ?2004 readline、?1049

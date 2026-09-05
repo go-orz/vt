@@ -43,6 +43,9 @@ func (vt *virtualTerminal) cursorChange(params []rune, action func(ps int)) {
 func (vt *virtualTerminal) insertChar(params []rune) error {
 	row := vt.getCurrentRow()
 	ps := vt.getNumberOrDefault(params, 0, 1)
+	if ps == 0 {
+		ps = 1
+	}
 	for range ps {
 		row.insert(space)
 	}
@@ -73,14 +76,18 @@ func (vt *virtualTerminal) cursorBackward(params []rune) error {
 	return nil
 }
 
-// 光标移动到下面第n（默认1）行的开头。
+// 光标移动到下面第n（默认1）行的开头。CNL 除了下移还必须回到行首（CR 语义）。
 func (vt *virtualTerminal) cursorNextLine(params []rune) error {
-	return vt.cursorDown(params)
+	vt.cursorChange(params, vt.moveDown)
+	vt.setCol(0)
+	return nil
 }
 
-// 光标移动到上面第n（默认1）行的开头。
+// 光标移动到上面第n（默认1）行的开头。CPL 除了上移还必须回到行首（CR 语义）。
 func (vt *virtualTerminal) cursorPrecedingLine(params []rune) error {
-	return vt.cursorUp(params)
+	vt.cursorChange(params, vt.moveUp)
+	vt.setCol(0)
+	return nil
 }
 
 // 光标移动到第n（默认1）列。CSI G 的列是 1-based。
@@ -149,14 +156,28 @@ func (vt *virtualTerminal) eraseInLine(params []rune) error {
 // Delete Ps Character(s) (default = 1) (DCH).
 func (vt *virtualTerminal) deleteChars(params []rune) error {
 	ps := vt.getNumberOrDefault(params, 0, 1)
+	if ps == 0 {
+		ps = 1
+	}
 	row := vt.getCurrentRow()
 	row.delete(ps)
 	return nil
 }
 
 // Erase Ps Character(s) (default = 1) (ECH).
+// ECH 与 DCH 不同：它用空格覆盖 N 个字符，后续内容保持原位不左移。
 func (vt *virtualTerminal) eraseChars(params []rune) error {
-	return vt.deleteChars(params)
+	ps := vt.getNumberOrDefault(params, 0, 1)
+	if ps == 0 {
+		ps = 1
+	}
+	row := vt.getCurrentRow()
+	for i := range ps {
+		if idx := row.index + i; idx < len(row.data) {
+			row.data[idx] = space
+		}
+	}
+	return nil
 }
 
 // Character Position Absolute  [column] (default = [rows,1])。CSI ` 列是 1-based。

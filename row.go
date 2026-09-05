@@ -66,13 +66,13 @@ func (r *Row) eraseRight() {
 	}
 }
 
-// 删除当前光标所在位置左侧的字符（包含光标位置）
+// 删除当前光标所在位置左侧的字符（包含光标位置，ECMA-48 EL 1 语义）
 func (r *Row) eraseLeft() {
-	if r.index > 0 && r.index < len(r.data) {
-		// 保留光标位置之后的内容
-		r.data = r.data[r.index:]
+	if r.index < len(r.data) {
+		// 保留光标之后的内容，擦除 [0..index] 闭区间
+		r.data = r.data[r.index+1:]
 	} else {
-		// 光标在开头，或已超过行尾——整行清空
+		// 光标已超过行尾——整行清空
 		r.data = []rune{}
 	}
 	r.index = 0
