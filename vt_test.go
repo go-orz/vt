@@ -598,3 +598,124 @@ func TestDCHAndICHParamZeroIsOne(t *testing.T) {
 	v.Advance([]byte("\x1b[0P"))   // DCH 0 → 1：删掉 'b' → "ac"
 	mustEqualLines(t, v.Output(), []string{"ac"})
 }
+
+// ---------- Tab 制表位 ----------
+
+func TestTabMovesToNextTabStop(t *testing.T) {
+	// \t 移到下一个 8 列制表位，tab 本身不进入行数据
+	v := New()
+	v.Advance([]byte("a\tb"))
+	mustEqualLines(t, v.Output(), []string{"a       b"})
+}
+
+func TestTabAtLineStart(t *testing.T) {
+	v := New()
+	v.Advance([]byte("\tX"))
+	mustEqualLines(t, v.Output(), []string{"        X"})
+}
+
+func TestCHTAndCBT(t *testing.T) {
+	v := New()
+	v.Advance([]byte("\x1b[2I")) // CHT 2：到第 16 列
+	v.Advance([]byte("X"))
+	want := strings.Repeat(" ", 16) + "X"
+	if got := v.Output()[0]; got != want {
+		t.Errorf("CHT: got %q, want %q", got, want)
+	}
+	v.Advance([]byte("\x1b[2Z")) // CBT 2：光标在 17，依次回退 16、8
+	v.Advance([]byte("Y"))
+	got := v.Output()[0]
+	if got[8] != 'Y' {
+		t.Errorf("CBT: got %q, want Y at col 8", got)
+	}
+}
+
+func TestHTSCustomTabStop(t *testing.T) {
+	v := New()
+	v.Advance([]byte("abcd"))  // 光标在第 4 列
+	v.Advance([]byte("\x1bH")) // HTS：在第 4 列设制表位
+	v.Advance([]byte("\b\b"))  // 回到第 2 列
+	v.Advance([]byte("\t"))    // 下一个制表位是自定义的第 4 列（比默认 8 近）
+	v.Advance([]byte("X"))
+	mustEqualLines(t, v.Output(), []string{"abcdX"})
+}
+
+func TestTBCClearsAllStops(t *testing.T) {
+	v := New()
+	v.Advance([]byte("\x1b[3g")) // TBC 3：清除全部制表位（含默认网格）
+	v.Advance([]byte("\t"))      // 无处可去，原地不动
+	v.Advance([]byte("X"))
+	mustEqualLines(t, v.Output(), []string{"X"})
+}
+
+func TestResetRestoresTabStops(t *testing.T) {
+	v := New()
+	v.Advance([]byte("\x1b[3g"))
+	v.Reset()
+	v.Advance([]byte("\tX"))
+	if got := v.Output()[0]; got[8] != 'X' {
+		t.Errorf("after Reset tab stops should be default grid; got %q", got)
+	}
+}
+
+// ---------- 宽字符（CJK）显示宽度 ----------
+
+func TestWideCharWrapByDisplayWidth(t *testing.T) {
+	// cols=4："中a文"——中(2)+a(1)=3 列，文需要 2 列放不下 → 软 wrap
+	v := NewWithOptions(WithCols(4))
+	v.Advance([]byte("中a文"))
+	out := v.Output()
+	if len(out) != 2 || out[0] != "中a" || out[1] != "文" {
+		t.Errorf("got %q, want [中a 文]", out)
+	}
+}
+
+func TestWideCharLogicalLineMerge(t *testing.T) {
+	// 软 wrap 的中文行应合并为一条逻辑行
+	var got []string
+	v := NewWithOptions(WithCols(4), WithLineHandler(func(e LineEvent) { got = append(got, e.Line) }))
+	v.Advance([]byte("中文测试\n"))
+	if len(got) != 1 || got[0] != "中文测试" {
+		t.Errorf("got %q, want [中文测试]", got)
+	}
+}
+
+func TestWideCharFitsExactBoundary(t *testing.T) {
+	// cols=6："中文中" 恰好占满 6 列，不应 wrap
+	v := NewWithOptions(WithCols(6))
+	v.Advance([]byte("中文中"))
+	if out := v.Output(); len(out) != 1 || out[0] != "中文中" {
+		t.Errorf("got %q", out)
+	}
+}
+
+func TestWideCharOverwriteSecondHalfClearsLead(t *testing.T) {
+	// 光标落进宽字符占位列再写普通字符：宽字符清成空格（xterm 语义）。
+	// 文本层宽字符是 1 字符占 2 列：可见列为 中(0-1)、空格(2)、X(3)，
+	// 提取文本应为 "中 X"（占位空格不进入文本，与终端复制行为一致）。
+	v := New()
+	v.Advance([]byte("中文")) // data=[中,' ',文,' ']，光标列 4
+	v.Advance([]byte("\b"))  // 光标到"文"的占位列（列 3）
+	v.Advance([]byte("X"))   // "文" 清成空格，X 写在列 3
+	if got := v.Output()[0]; got != "中 X" {
+		t.Errorf("got %q, want %q", got, "中 X")
+	}
+}
+
+func TestWideCharTrailingTrim(t *testing.T) {
+	// 行尾宽字符的占位空格应被 String 的尾部裁剪处理掉
+	v := New()
+	v.Advance([]byte("中文"))
+	if out := v.Output(); len(out) != 1 || out[0] != "中文" {
+		t.Errorf("got %q, want [中文]", out)
+	}
+}
+
+func TestTabFromColumnAdjacentToStop(t *testing.T) {
+	// 回归：光标在第 15 列时，下一个制表位是 16，而不是 24。
+	// 文本层宽字符是 1 字符：列 0-14 提取为 "$ echo 中文目录"，列 15 空格，X 在列 16。
+	v := New()
+	v.Advance([]byte("$ echo 中文目录")) // 恰好 15 列
+	v.Advance([]byte("\tX"))
+	mustEqualLines(t, v.Output(), []string{"$ echo 中文目录 X"})
+}

@@ -19,12 +19,15 @@ func (vt *virtualTerminal) initCsiHandler() {
 	vt.addCsiHandler('K', vt.eraseInLine)
 	vt.addCsiHandler('P', vt.deleteChars)
 	vt.addCsiHandler('X', vt.eraseChars)
+	vt.addCsiHandler('Z', vt.cursorBackwardTab)
 	vt.addCsiHandler('`', vt.charPosAbsolute)
 	vt.addCsiHandler('a', vt.hPositionRelative)
 	vt.addCsiHandler('d', vt.linePosAbsolute)
 	vt.addCsiHandler('e', vt.vPositionRelative)
 	vt.addCsiHandler('f', vt.hVPosition)
+	vt.addCsiHandler('g', vt.tabClear)
 	vt.addCsiHandler('h', vt.setMode)
+	vt.addCsiHandler('I', vt.cursorHorizontalTab)
 	vt.addCsiHandler('l', vt.resetMode)
 	vt.addCsiHandler('m', vt.charAttributes)
 	vt.addCsiHandler('r', vt.setScrollRegion)
@@ -218,6 +221,39 @@ func (vt *virtualTerminal) vPositionRelative(params []rune) error {
 // Horizontal and Vertical Position [rows;column] (default = [1,1]) (HVP).
 func (vt *virtualTerminal) hVPosition(params []rune) error {
 	return vt.cursorPosition(params)
+}
+
+// Cursor Horizontal Tabulation (CHT, CSI Pn I)：光标前进 n 个制表位。
+func (vt *virtualTerminal) cursorHorizontalTab(params []rune) error {
+	ps := vt.getNumberOrDefault(params, 0, 1)
+	if ps == 0 {
+		ps = 1
+	}
+	vt.nextTab(ps)
+	return nil
+}
+
+// Cursor Backward Tabulation (CBT, CSI Pn Z)：光标后退 n 个制表位。
+func (vt *virtualTerminal) cursorBackwardTab(params []rune) error {
+	ps := vt.getNumberOrDefault(params, 0, 1)
+	if ps == 0 {
+		ps = 1
+	}
+	vt.prevTab(ps)
+	return nil
+}
+
+// Tab Clear (TBC, CSI Pn g)：0 清除当前列的制表位；3 清除全部制表位
+// （包括默认的 8 列网格，之后只有 HTS 重新设置的制表位生效）。
+func (vt *virtualTerminal) tabClear(params []rune) error {
+	switch vt.getNumberOrDefault(params, 0, 0) {
+	case 0:
+		delete(vt.tabstops, vt.getCurrentRow().index)
+	case 3:
+		vt.tabstops = make(map[int]bool)
+		vt.defaultTabGrid = false
+	}
+	return nil
 }
 
 func (vt *virtualTerminal) parseCSIParams(params []rune) (isPrivate bool, values []int) {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/ansi/parser"
+	"github.com/mattn/go-runewidth"
 )
 
 const (
@@ -26,6 +27,9 @@ const (
 	_ESC rune = 0x1b // Escape (Caret = ^[, C = \e)
 
 	space rune = 0x20 // 空格
+
+	// defaultTabStop 默认制表位网格间隔（每 8 列一个制表位，与 xterm 一致）。
+	defaultTabStop = 8
 )
 
 // maxStringDataSize 限制单个 OSC/DCS 等 string sequence 的 payload 大小，
@@ -137,6 +141,7 @@ func NewWithOptions(opts ...Opt) VirtualTerminal {
 	for _, opt := range opts {
 		opt(vt)
 	}
+	vt.resetTabStops()
 	vt.initCsiHandler()
 	vt.initParser()
 	return vt
@@ -157,6 +162,9 @@ type virtualTerminal struct {
 	pendingLines []pendingLine // commitLogicalLine 在锁内追加，Advance 解锁后回放给 lineHandler
 
 	oscHandler OSCHandler
+
+	tabstops       map[int]bool // 显式设置的制表位（HTS 添加、TBC 移除）
+	defaultTabGrid bool         // 是否启用每 8 列的默认制表位网格（TBC 3 关闭）
 
 	hasSavedCursor bool // ESC 7 保存的光标状态
 	savedRow       int
@@ -266,8 +274,8 @@ func (vt *virtualTerminal) handleExecute(b byte) {
 	case _BS: // \b BS 在 VT 语义里只是"光标左移一格"，并不删除字符。
 		// bash 的 readline 重绘提示符时常用 BS + 空格擦除残留字符，如果这里直接删字符会让行内容丢失。
 		vt.getCurrentRow().moveLeft()
-	case _HT: // \t 这里简化为输出一个 TAB 字符
-		vt.appendCharacter(_HT)
+	case _HT: // \t 移到下一个制表位（默认每 8 列），tab 字符本身不进入行数据
+		vt.nextTab(1)
 	case _LF, _VT, _FF: // \n / \v / \f 都向下移动一行——硬换行，提交逻辑行
 		vt.commitLogicalLine()
 		vt.moveDown(1)
@@ -314,10 +322,64 @@ func (vt *virtualTerminal) handleEsc(cmd ansi.Cmd) {
 		vt.setCol(0)
 	case 'M': // RI 反向索引：上移一行
 		vt.moveUp(1)
-	case 'c': // RIS 完全复位：等价 Reset（屏幕 + 私有模式 + 保存的光标）
+	case 'H': // HTS 在当前列设置制表位
+		vt.tabstops[vt.getCurrentRow().index] = true
+	case 'c': // RIS 完全复位：等价 Reset（屏幕 + 私有模式 + 保存的光标 + 制表位）
 		vt.resetScreenLocked()
 		vt.privateModes = make(map[int]bool)
 		vt.hasSavedCursor = false
+		vt.resetTabStops()
+	}
+}
+
+// resetTabStops 把制表位恢复为默认的每 8 列网格。
+func (vt *virtualTerminal) resetTabStops() {
+	vt.tabstops = make(map[int]bool)
+	vt.defaultTabGrid = true
+}
+
+// nextTab 光标移到之后第 n 个制表位。候选位取默认网格与显式设置（HTS）中
+// 更近的一个；没有可用制表位时，cols>0 则移到最后一列（xterm 语义），否则原地不动。
+func (vt *virtualTerminal) nextTab(n int) {
+	row := vt.getCurrentRow()
+	for range n {
+		next := 0
+		if vt.defaultTabGrid {
+			// 光标在 15 列 → 下一个 stop 是 16；恰好在 stop 上（16）→ 跳到 24
+			next = ((row.index / defaultTabStop) + 1) * defaultTabStop
+		}
+		for stop := range vt.tabstops {
+			if stop > row.index && (next == 0 || stop < next) {
+				next = stop
+			}
+		}
+		if next == 0 {
+			if vt.cols > 0 && row.index < vt.cols-1 {
+				vt.setCol(vt.cols - 1)
+			}
+			return
+		}
+		if vt.cols > 0 && next > vt.cols-1 {
+			next = vt.cols - 1
+		}
+		vt.setCol(next)
+	}
+}
+
+// prevTab 光标移到之前第 n 个制表位，没有更靠前的制表位时停在行首。
+func (vt *virtualTerminal) prevTab(n int) {
+	row := vt.getCurrentRow()
+	for range n {
+		prev := 0
+		if vt.defaultTabGrid && row.index > 0 {
+			prev = ((row.index - 1) / defaultTabStop) * defaultTabStop
+		}
+		for stop := range vt.tabstops {
+			if stop < row.index && stop > prev {
+				prev = stop
+			}
+		}
+		vt.setCol(prev)
 	}
 }
 
@@ -390,17 +452,23 @@ func (vt *virtualTerminal) getNumberOrDefault(params []rune, index, _default int
 	return _default
 }
 
+// appendCharacter 追加一个可打印字符。宽度按显示宽度计算（CJK 等
+// 宽字符占 2 列，组合字符等零宽字符按 1 列处理），cols>0 时按显示宽度软 wrap。
 func (vt *virtualTerminal) appendCharacter(code rune) {
+	w := runewidth.RuneWidth(code)
+	if w < 1 {
+		w = 1
+	}
 	if vt.cols > 0 {
 		row := vt.getCurrentRow()
-		if row.index >= vt.cols {
+		if row.index+w > vt.cols {
 			// 软 wrap：进入下一物理行，并标记为 wrappedFromPrev，让 commitLogicalLine 能合并回去
 			vt.moveDown(1)
 			vt.setCol(0)
 			vt.getCurrentRow().wrappedFromPrev = true
 		}
 	}
-	vt.getCurrentRow().append(code)
+	vt.getCurrentRow().append(code, w)
 }
 
 func (vt *virtualTerminal) Advance(p []byte) {
@@ -445,6 +513,7 @@ func (vt *virtualTerminal) Reset() {
 	vt.resetScreenLocked()
 	vt.privateModes = make(map[int]bool)
 	vt.hasSavedCursor = false
+	vt.resetTabStops()
 }
 
 // ResetScreen 仅重置屏幕状态——保留私有模式（如 ?2004 readline、?1049
