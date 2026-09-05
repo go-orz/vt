@@ -1,6 +1,7 @@
 package vt
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -905,5 +906,320 @@ func TestRowGrowthViaLFIsUnbounded(t *testing.T) {
 	v.Advance([]byte(strings.Repeat("\n", maxScreenDim+10)))
 	if n := len(v.Output()); n != maxScreenDim+11 {
 		t.Errorf("rows: got %d, want %d", n, maxScreenDim+11)
+	}
+}
+
+// ---------- 双屏隔离与有界行窗口 ----------
+
+// TestMaxLinesEvictsOldest 验证 WithMaxLines 后行窗口有界，且驱逐的是
+// 最老的行、新近内容与光标行保留。
+func TestMaxLinesEvictsOldest(t *testing.T) {
+	v := NewWithOptions(WithMaxLines(100))
+	for i := 0; i < 500; i++ {
+		v.Advance([]byte(fmt.Sprintf("line-%d\r\n", i)))
+	}
+	out := v.Output()
+	if n := len(out); n > 100 {
+		t.Fatalf("rows: got %d, want <= 100", n)
+	}
+	// 最老的行被驱逐，最新的行（499 刚提交后光标在空行 500 上）保留
+	last := out[len(out)-2] // 倒数第二行是 "line-499"
+	if last != "line-499" {
+		t.Errorf("newest content lost: got %q", last)
+	}
+}
+
+// TestMaxLinesKeepsPromptRow 验证驱逐不影响正在编辑的当前行——
+// 识别场景的核心要求：prompt 行永远在窗口内，行提交不丢。
+func TestMaxLinesKeepsPromptRow(t *testing.T) {
+	var lines []string
+	v := NewWithOptions(WithMaxLines(10), WithLineHandler(func(e LineEvent) {
+		lines = append(lines, e.Line)
+	}))
+	// 先滚动超出窗口，制造持续驱逐的状态
+	for i := 0; i < 30; i++ {
+		v.Advance([]byte("scroll\r\n"))
+	}
+	// 此时写一条 prompt 行并提交——不应因驱逐丢失
+	v.Advance([]byte("\x1b[?2004h"))
+	v.Advance([]byte("root@host:~# echo hi\r\n"))
+	v.Advance([]byte("\x1b[?2004l"))
+	found := false
+	for _, l := range lines {
+		if l == "root@host:~# echo hi" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("prompt line lost after eviction, got lines %q", lines)
+	}
+	// 当前行（?2004h 的 prompt）在窗口内
+	out := v.Output()
+	if out[len(out)-2] != "root@host:~# echo hi" {
+		t.Errorf("current row content: got %q", out[len(out)-2])
+	}
+}
+
+// TestAltScreenIsolation 验证 ?1049h 切到独立 alt 屏：alt 内容不混入
+// main，退出后 main 原样恢复（含光标位置）。
+func TestAltScreenIsolation(t *testing.T) {
+	var lines []LineEvent
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		lines = append(lines, e)
+	}))
+	v.Advance([]byte("main-before\r\n"))
+	mainBefore := v.Output()
+
+	v.Advance([]byte("\x1b[?1049h"))
+	v.Advance([]byte("alt-content\r\nalt-more\r\n"))
+
+	v.Advance([]byte("\x1b[?1049l"))
+	// 退出后 main 恢复：内容与进入前一致，且可以继续追加
+	v.Advance([]byte("main-after\r\n"))
+
+	out := v.Output()
+	if out[0] != "main-before" {
+		t.Errorf("main row 0 corrupted by alt: got %q", out[0])
+	}
+	if out[len(out)-1] != "main-after" && out[len(out)-2] != "main-after" {
+		t.Errorf("main-after missing: got %q", out)
+	}
+	// 只比对进入前有内容的行——?1049l 会恢复光标到进入前的空行，
+	// 退出后继续写会落在那里（row 1 变成 "main-after" 是光标恢复正确的证明）
+	for i, r := range mainBefore {
+		if r == "" {
+			continue
+		}
+		if i < len(out) && out[i] != r {
+			t.Errorf("main row %d changed during alt: got %q want %q", i, out[i], r)
+		}
+	}
+	// alt 期间的行事件携带 IsAltScreen 快照，且内容不进 main
+	for _, e := range lines {
+		if e.Line == "alt-content" || e.Line == "alt-more" {
+			if !e.Modes.IsAltScreen() {
+				t.Errorf("alt line %q lacks alt-screen mode snapshot", e.Line)
+			}
+		}
+	}
+}
+
+// TestAltScreenBounded 验证 alt 屏同样受 WithMaxLines 约束——
+// top/htop 常驻重绘不会无限累积。
+func TestAltScreenBounded(t *testing.T) {
+	v := NewWithOptions(WithMaxLines(50))
+	v.Advance([]byte("\x1b[?1049h"))
+	for i := 0; i < 1000; i++ {
+		v.Advance([]byte(strings.Repeat("x", 40) + "\r\n"))
+	}
+	if n := len(v.Output()); n > 50 {
+		t.Fatalf("alt screen rows: got %d, want <= 50", n)
+	}
+	// 退出后 main 未被污染
+	v.Advance([]byte("\x1b[?1049l"))
+	if n := len(v.Output()); n > 1 {
+		t.Errorf("main screen grew during alt: got %d rows", n)
+	}
+}
+
+// TestUnboundedRowForceWraps 验证 cols==0 时超长单行按 maxRowRunes
+// 强制软 wrap，行提交仍拼回完整逻辑行。
+func TestUnboundedRowForceWraps(t *testing.T) {
+	var got []string
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		got = append(got, e.Line)
+	}))
+	// 2 倍上限的无换行文本 + 收尾换行
+	text := strings.Repeat("a", 2*maxRowRunes)
+	v.Advance([]byte(text))
+	// 行已 wrap 成多段，物理行有界
+	if n := len(v.Output()); n < 2 {
+		t.Fatalf("expected force-wrapped rows, got %d", len(v.Output()))
+	}
+	for _, row := range v.Output() {
+		if len(row) > maxRowRunes+8 {
+			t.Errorf("physical row too long: %d", len(row))
+		}
+	}
+	v.Advance([]byte("\r\n"))
+	if len(got) != 1 || len(got[0]) < 2*maxRowRunes {
+		t.Fatalf("logical line incomplete: %d lines, first len %d", len(got), len(got[0]))
+	}
+}
+
+// TestMode1047ClearsAltOnExit 验证 ?1047l 的清屏语义（清 alt 再切回）；
+// 对比 ?47l 仅切回不清屏（xterm 语义）。
+func TestMode1047ClearsAltOnExit(t *testing.T) {
+	v := New()
+	v.Advance([]byte("\x1b[?1047h"))
+	v.Advance([]byte("alt-junk\r\n"))
+	v.Advance([]byte("\x1b[?1047l"))
+	// 重新进入 1047，alt 应已被 ?1047l 清空
+	v.Advance([]byte("\x1b[?1047h"))
+	for _, r := range v.Output() {
+		if r != "" {
+			t.Errorf("alt screen not cleared by ?1047l: got %v", v.Output())
+			break
+		}
+	}
+
+	// ?47l 仅切回：再进 ?47h 时旧内容仍在
+	v2 := New()
+	v2.Advance([]byte("\x1b[?47h"))
+	v2.Advance([]byte("keep-me\r\n"))
+	v2.Advance([]byte("\x1b[?47l"))
+	v2.Advance([]byte("\x1b[?47h"))
+	found := false
+	for _, r := range v2.Output() {
+		if r == "keep-me" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("?47l should not clear alt screen, but content lost: %v", v2.Output())
+	}
+}
+
+// ---------- OSC 133 shell integration 命令输入区 ----------
+
+// feedOSC133 发一个 OSC 133 标记（ST 终止符风格，与 BEL 等价）。
+func feedOSC133(v VirtualTerminal, marker string) {
+	v.Advance([]byte("\x1b]133;" + marker + "\x1b\\"))
+}
+
+func TestOSC133BasicCommandText(t *testing.T) {
+	var events []LineEvent
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		events = append(events, e)
+	}))
+
+	feedOSC133(v, "A")                     // prompt 开始
+	v.Advance([]byte("root@host:~# "))     // prompt 文字
+	feedOSC133(v, "B")                     // 命令输入区开始
+	v.Advance([]byte("echo hi"))           // 用户输入回显
+	v.Advance([]byte("\r\n"))              // Enter 提交
+	feedOSC133(v, "C")                     // 命令输出开始
+	v.Advance([]byte("hi\r\n"))            // 命令输出
+	feedOSC133(v, "D;0")                   // 命令结束
+
+	if len(events) != 2 {
+		t.Fatalf("events: got %d, want 2", len(events))
+	}
+	if events[0].Line != "root@host:~# echo hi" {
+		t.Errorf("line: got %q", events[0].Line)
+	}
+	if events[0].CmdText != "echo hi" {
+		t.Errorf("cmd: got %q, want %q", events[0].CmdText, "echo hi")
+	}
+	// C 之后的输出行不再处于命令输入区
+	if events[1].CmdText != "" {
+		t.Errorf("output line should have empty CmdText, got %q", events[1].CmdText)
+	}
+}
+
+func TestOSC133TabCompletionRedraw(t *testing.T) {
+	var events []LineEvent
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		events = append(events, e)
+	}))
+
+	feedOSC133(v, "A")
+	v.Advance([]byte("root@host:~# "))
+	feedOSC133(v, "B")
+	v.Advance([]byte("ec")) // 部分输入
+	// readline Tab 补全：回到行首清行后全量重绘 prompt+补全结果
+	v.Advance([]byte("\r\x1b[Kroot@host:~# echo hello.txt"))
+	v.Advance([]byte("\r\n"))
+	feedOSC133(v, "C")
+	feedOSC133(v, "D;0")
+
+	if len(events) != 1 {
+		t.Fatalf("events: got %d, want 1", len(events))
+	}
+	if events[0].CmdText != "echo hello.txt" {
+		t.Errorf("cmd after redraw: got %q, want %q", events[0].CmdText, "echo hello.txt")
+	}
+}
+
+func TestOSC133WideCharPrompt(t *testing.T) {
+	var events []LineEvent
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		events = append(events, e)
+	}))
+
+	feedOSC133(v, "A")
+	v.Advance([]byte("用户@主机:~$ ")) // 宽字符 prompt
+	feedOSC133(v, "B")
+	v.Advance([]byte("ls -la"))
+	v.Advance([]byte("\r\n"))
+	feedOSC133(v, "C")
+	feedOSC133(v, "D;0")
+
+	if len(events) != 1 || events[0].CmdText != "ls -la" {
+		t.Fatalf("wide-char prompt cmd: got %#v", events)
+	}
+}
+
+func TestOSC133ContinuationFirstSegment(t *testing.T) {
+	var events []LineEvent
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		events = append(events, e)
+	}))
+
+	feedOSC133(v, "A")
+	v.Advance([]byte("$ "))
+	feedOSC133(v, "B")
+	v.Advance([]byte("echo \"hello\r\n")) // 引号续行：首段提交
+	v.Advance([]byte("> world\"\r\n"))    // PS2 续行提交
+	feedOSC133(v, "C")
+	feedOSC133(v, "D;0")
+
+	// 首段照常切出（与正则兜底对齐），续行不再切
+	if len(events) != 2 {
+		t.Fatalf("events: got %d, want 2", len(events))
+	}
+	if events[0].CmdText != `echo "hello` {
+		t.Errorf("first segment: got %q", events[0].CmdText)
+	}
+	if events[1].CmdText != "" {
+		t.Errorf("continuation should not carry cmd, got %q", events[1].CmdText)
+	}
+}
+
+func TestOSC133MissingCClosesOnNextA(t *testing.T) {
+	var events []LineEvent
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		events = append(events, e)
+	}))
+
+	// B 后流异常（C 丢失），下一个 A 开启新循环——旧区域必须失效
+	feedOSC133(v, "A")
+	v.Advance([]byte("$ "))
+	feedOSC133(v, "B")
+	v.Advance([]byte("cmd1\r\n"))
+	// C 丢失，直接下一个 A
+	feedOSC133(v, "A")
+	v.Advance([]byte("$ "))
+	feedOSC133(v, "B")
+	v.Advance([]byte("cmd2\r\n"))
+	feedOSC133(v, "C")
+
+	if len(events) != 2 {
+		t.Fatalf("events: got %d, want 2", len(events))
+	}
+	if events[0].CmdText != "cmd1" || events[1].CmdText != "cmd2" {
+		t.Errorf("cmds: got %q, %q", events[0].CmdText, events[1].CmdText)
+	}
+}
+
+func TestOSC133AbsentYieldsEmptyCmdText(t *testing.T) {
+	var events []LineEvent
+	v := NewWithOptions(WithLineHandler(func(e LineEvent) {
+		events = append(events, e)
+	}))
+	v.Advance([]byte("\x1b[?2004h"))
+	v.Advance([]byte("root@host:~# plain-regex-path\r\n"))
+	if len(events) != 1 || events[0].CmdText != "" {
+		t.Fatalf("non-integration flow should have empty CmdText, got %#v", events)
 	}
 }

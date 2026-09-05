@@ -158,10 +158,34 @@ func (r *Row) eraseLeft() {
 }
 
 func (r *Row) String() string {
+	return stringFrom(r.data)
+}
+
+// textFromCol 返回从列 col（0-based）起至行尾的文本，用于 OSC 133
+// 命令输入区切分：col 左方是 prompt，右方是用户命令。
+// 行不变式是 data 下标与列号一致（宽字符 lead + 占位空格 = 2 个下标），
+// 光标 index 也按同一计法推进，因此直接按下标切分。
+// col 恰好落在宽字符的占位空格上时（防御：prompt 结束列由 shell 控制，
+// 正常不会停在宽字符中间），从 lead 起切以保留完整宽字符。
+func (r *Row) textFromCol(col int) string {
+	if col < 0 {
+		col = 0
+	}
+	if col > 0 && col < len(r.data) && r.data[col] == space && runeWidth(r.data[col-1]) > 1 {
+		col--
+	}
+	if col >= len(r.data) {
+		return ""
+	}
+	return stringFrom(r.data[col:])
+}
+
+// stringFrom 把行 rune 序列输出为文本：跳过宽字符的占位空格，去除尾部空格。
+func stringFrom(data []rune) string {
 	var b strings.Builder
-	for i, c := range r.data {
+	for i, c := range data {
 		// 宽字符的占位空格不输出：我们的不变式是宽字符后必然紧跟其占位空格
-		if c == space && i > 0 && runeWidth(r.data[i-1]) > 1 {
+		if c == space && i > 0 && runeWidth(data[i-1]) > 1 {
 			continue
 		}
 		b.WriteRune(c)

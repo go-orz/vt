@@ -304,8 +304,9 @@ func (vt *virtualTerminal) parseCSIParams(params []rune) (isPrivate bool, values
  * | 12    | Send/receive (SRM). Always off.        | #N      |
  * | 20    | Automatic Newline (LNM). Always off.   | #N      |
  */
-// setMode 处理 CSI Pm h。私有模式（带 ?，如 ?2004 bracketed paste、?1049 alt screen、?25 cursor）
-// 仅记录到 privateModes，由调用方通过 IsPrivateModeSet 查询。ANSI 标准模式当前忽略。
+// setMode 处理 CSI Pm h。私有模式（带 ?，如 ?2004 bracketed paste、?25 cursor）
+// 记录到 privateModes，由调用方通过 IsPrivateModeSet 查询；alt screen 相关模式
+// （?1049/?1047/?47）额外执行真实的双屏切换。ANSI 标准模式当前忽略。
 func (vt *virtualTerminal) setMode(params []rune) error {
 	isPrivate, values := vt.parseCSIParams(params)
 	if !isPrivate {
@@ -313,11 +314,20 @@ func (vt *virtualTerminal) setMode(params []rune) error {
 	}
 	for _, v := range values {
 		vt.privateModes[v] = true
+		switch v {
+		case 1049:
+			// xterm: 保存光标 + 切 alt + 清 alt
+			vt.enterAltScreen(true, true)
+		case 1047, 47:
+			// 仅切换，不清 alt（1047h 语义：已在 alt 时无操作）
+			vt.enterAltScreen(false, false)
+		}
 	}
 	return nil
 }
 
-// resetMode 处理 CSI Pm l——私有模式从 privateModes 中删除；ANSI 标准模式当前忽略。
+// resetMode 处理 CSI Pm l——私有模式从 privateModes 中删除；alt screen 模式
+// 对应切回 main 屏（?1049l 恢复光标，?1047l 清 alt 后切回）。ANSI 标准模式忽略。
 func (vt *virtualTerminal) resetMode(params []rune) error {
 	isPrivate, values := vt.parseCSIParams(params)
 	if !isPrivate {
@@ -325,6 +335,14 @@ func (vt *virtualTerminal) resetMode(params []rune) error {
 	}
 	for _, v := range values {
 		delete(vt.privateModes, v)
+		switch v {
+		case 1049:
+			vt.exitAltScreen(false, true)
+		case 1047:
+			vt.exitAltScreen(true, false)
+		case 47:
+			vt.exitAltScreen(false, false)
+		}
 	}
 	return nil
 }

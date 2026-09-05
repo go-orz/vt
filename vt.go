@@ -48,6 +48,21 @@ const maxInsertCells = 1 << 20
 // 发送会被已有内容长度卡住，不会持续放大内存。
 const maxScreenDim = 1 << 16
 
+// maxRowRunes 钳制单个物理行的最大长度（cols==0 不软 wrap 时生效）。
+// 无换行的超长输出（如 cat 单行大文件、进度条回车重绘前的意外长行）
+// 会让一行的 data 无限增长；达到上限后强制软 wrap 到新物理行，并标记
+// wrappedFromPrev——commitLogicalLine 仍会把各段拼回完整逻辑行，识别
+// 语义无损，只是物理行内存有界。cols>0 时每行已被列宽限制，不受影响。
+const maxRowRunes = 1 << 20
+
+// screenState 保存一块屏幕缓冲的状态：行窗口与光标所在行索引。
+// main 与 alt 是两块独立的屏（参考终端模拟器的 scrs[2] 设计）——
+// alt screen 内 TUI 应用的重绘只影响 alt 自己的行，退出时 main 原样恢复。
+type screenState struct {
+	rowList []*Row // 行数据
+	rows    int    // 当前行索引（0-based，相对本屏窗口）
+}
+
 type inputHandler func(params []rune) error
 
 // LineEvent 是每次硬 LF 时 LineHandler 收到的事件。
@@ -62,6 +77,13 @@ type inputHandler func(params []rune) error
 type LineEvent struct {
 	Line  string
 	Modes ModeSnapshot
+	// CmdText 是 shell integration（OSC 133）提供的结构化命令文本：
+	// shell 发 133;A 标记 prompt 开始、133;B 标记命令输入区开始（B 时刻
+	// 光标列即 prompt 宽度），用户按 Enter 提交行时，B 到行尾的文本就是
+	// 精确命令——含 Tab 补全与 history 回退后的最终形态，无需 prompt
+	// 正则猜测。非 133 流（shell 未装 integration）为空串，调用方应退回
+	// Modes + 正则识别；多行续行命令无法单行切分时同样为空串。
+	CmdText string
 }
 
 // ModeSnapshot 是一组私有模式状态的快照副本。零值表示空快照（所有模式未设置）。
@@ -113,6 +135,18 @@ func WithCols(cols int) Opt {
 	}
 }
 
+// WithMaxLines 设置单块屏幕行窗口的上限（scrollback + 可见区的总行数）。
+// 超限时最老的行从窗口头部被驱逐——与整屏清空不同，光标行与近期行始终
+// 保留，正在编辑的 prompt 行不受影响，行提交回调照常工作。
+// main 与 alt 两块屏各自独立计算上限。默认 0 表示无界（兼容旧行为）。
+func WithMaxLines(n int) Opt {
+	return func(vt *virtualTerminal) {
+		if n > 0 {
+			vt.maxLines = n
+		}
+	}
+}
+
 // WithLineHandler 注册行提交回调。每次硬 LF 触发一次，
 // 回调在 Advance 释放内部锁之后同步执行，避免在锁内回调阻塞。
 func WithLineHandler(h LineHandler) Opt {
@@ -146,10 +180,9 @@ func NewWithOptions(opts ...Opt) VirtualTerminal {
 	vt := &virtualTerminal{
 		inputHandlers: make(map[byte]inputHandler),
 		privateModes:  make(map[int]bool),
-		rowList:       make([]*Row, 0),
-		rows:          0,
 		logger:        nil,
 	}
+	vt.screenState = &vt.mainScr
 	for _, opt := range opts {
 		opt(vt)
 	}
@@ -161,9 +194,14 @@ func NewWithOptions(opts ...Opt) VirtualTerminal {
 
 type virtualTerminal struct {
 	sync.RWMutex
-	rowList []*Row // 行数据
-	rows    int    // 当前行索引（0-based）
-	cols    int    // 列宽，0 表示不限
+	// screenState 是当前活动屏（嵌入指针，rowList/rows 字段被提升），
+	// ?1049/?1047/?47 切屏时换成另一块的指针——所有通过 vt.rowList /
+	// vt.rows 的既有访问自动作用于活动屏。
+	*screenState
+	mainScr  screenState // 主屏：shell 交互与滚动历史
+	altScr   screenState // alt 屏：vim/less/top 等 TUI 的独立缓冲
+	cols     int         // 列宽，0 表示不限
+	maxLines int         // 单屏行窗口上限，0 表示无界
 
 	parser *ansi.Parser // 跨 Advance 持久保存解析状态的 ANSI 字节流状态机
 
@@ -183,13 +221,27 @@ type virtualTerminal struct {
 	savedRow       int
 	savedCol       int
 
+	// ?1049 专用的光标保存（DECSC 与 1049 是两套独立机制）
+	altSavedRow    int
+	altSavedCol    int
+	inAltScreen    bool // 当前是否处于 alt 屏（与 privateModes 位同步维护）
+
+	// OSC 133 命令输入区状态（shell integration 语义）：
+	// 133;B 时光标位于命令输入起点（其左方即 prompt），快照 (row, col)
+	// 后，该逻辑行提交时从 col 起切出的文本就是精确命令；133;C（命令
+	// 输出开始）或 133;A/D（新循环/结束）关闭区域。
+	cmdZoneRow    int
+	cmdZoneCol    int
+	cmdZoneActive bool
+
 	logger *log.Logger
 }
 
 // pendingLine 记录一条尚未交给 LineHandler 的提交事件。
 type pendingLine struct {
-	line  string
-	modes ModeSnapshot
+	line    string
+	modes   ModeSnapshot
+	cmdText string
 }
 
 // IsAltScreen 检查终端是否处于 alt screen 缓冲区。
@@ -219,8 +271,74 @@ func (vt *virtualTerminal) getCurrentRow() *Row {
 			vt.newRow()
 		}
 	}
+	vt.evictLocked()
 
 	return vt.rowList[vt.rows]
+}
+
+// evictLocked 执行行窗口上限驱逐（假定已持写锁）。窗口超出 maxLines 时
+// 从头部移除最老的行，并把光标行索引同步前移——正在编辑的行与新近内容
+// 始终保留在窗口内。驱逐的行不参与任何后续行提交（提交发生在 LF 时刻，
+// 远在窗口头部的行早已提交过或本就不属于当前逻辑行）。
+func (vt *virtualTerminal) evictLocked() {
+	if vt.maxLines <= 0 {
+		return
+	}
+	overflow := len(vt.rowList) - vt.maxLines
+	if overflow <= 0 {
+		return
+	}
+	for i := range overflow {
+		vt.rowList[i] = nil // 释放引用，帮助 GC
+	}
+	copy(vt.rowList, vt.rowList[overflow:])
+	vt.rowList = vt.rowList[:len(vt.rowList)-overflow]
+	vt.rows -= overflow
+	if vt.rows < 0 {
+		vt.rows = 0
+	}
+	// OSC 133 命令区快照行号随窗口前移；被驱逐越过时区域失效
+	if vt.cmdZoneActive {
+		vt.cmdZoneRow -= overflow
+		if vt.cmdZoneRow < 0 {
+			vt.cmdZoneRow = 0
+			vt.cmdZoneActive = false
+		}
+	}
+}
+
+// enterAltScreen 切到 alt 屏。clear 为 true 对应 ?1049h 语义（进入即清空
+// alt 屏）；saveCursor 为 true 时保存 main 屏光标，供 ?1049l 恢复。
+// main 屏的行窗口与光标在 alt 期间原样冻结。
+func (vt *virtualTerminal) enterAltScreen(clear, saveCursor bool) {
+	if vt.inAltScreen {
+		return
+	}
+	if saveCursor {
+		vt.altSavedRow = vt.rows
+		vt.altSavedCol = vt.getCurrentRow().index
+	}
+	if clear {
+		vt.altScr = screenState{}
+	}
+	vt.screenState = &vt.altScr
+	vt.inAltScreen = true
+}
+
+// exitAltScreen 切回 main 屏。restoreCursor 对应 ?1049l 恢复进入前保存的
+// 光标；clearAlt 对应 ?1047l 的"清 alt 再切回"语义。
+func (vt *virtualTerminal) exitAltScreen(clearAlt, restoreCursor bool) {
+	if !vt.inAltScreen {
+		return
+	}
+	if clearAlt {
+		vt.altScr = screenState{}
+	}
+	vt.screenState = &vt.mainScr
+	vt.inAltScreen = false
+	if restoreCursor {
+		vt.moveTo(vt.altSavedCol, vt.altSavedRow)
+	}
 }
 
 func (vt *virtualTerminal) newRow() *Row {
@@ -342,8 +460,12 @@ func (vt *virtualTerminal) handleEsc(cmd ansi.Cmd) {
 		col := vt.getCurrentRow().index
 		vt.tabstops[col] = true
 		delete(vt.clearedTabStops, col)
-	case 'c': // RIS 完全复位：等价 Reset（屏幕 + 私有模式 + 保存的光标 + 制表位）
-		vt.resetScreenLocked()
+	case 'c': // RIS 完全复位：等价 Reset（两块屏 + 私有模式 + 保存的光标 + 制表位）
+		vt.mainScr = screenState{}
+		vt.altScr = screenState{}
+		vt.screenState = &vt.mainScr
+		vt.inAltScreen = false
+		vt.cmdZoneActive = false
 		vt.privateModes = make(map[int]bool)
 		vt.hasSavedCursor = false
 		vt.resetTabStops()
@@ -467,18 +589,44 @@ func (vt *virtualTerminal) prevTab(n int) {
 	}
 }
 
-// handleOsc 回调 OSCHandler。解析器给出的 data 是 ESC ] 与终止符之间的
-// 完整 payload（含前导 cmd，如 "1337;CurrentDir=/tmp"），与手写解析层
-// 时代的 payload 格式一致，直接透传。
+// handleOsc 回调 OSCHandler，并维护 OSC 133 命令输入区状态。解析器给出的
+// data 是 ESC ] 与终止符之间的完整 payload（含前导 cmd，如
+// "1337;CurrentDir=/tmp"），与手写解析层时代的 payload 格式一致，直接透传。
 func (vt *virtualTerminal) handleOsc(_ int, data []byte) {
+	if payload := string(data); strings.HasPrefix(payload, "133;") {
+		vt.handleSemanticMarker(payload[len("133;"):])
+	}
 	if vt.oscHandler == nil || len(data) == 0 {
 		return
 	}
 	vt.oscHandler(string(data))
 }
 
+// handleSemanticMarker 处理 shell integration 的 OSC 133 语义标记：
+//
+//	A = prompt 开始；B = 命令输入区开始；C = 命令输出开始；D = 命令结束。
+//
+// 命令文本的切分只依赖 B：B 时刻光标 (row, col) 的左方是 prompt、右方是
+// 用户即将输入（及 Tab 补全后的最终形态）的命令；首个 LF 提交该行时从
+// col 起切即为精确命令。C/D/A 关闭区域——C 之后的 LF 属于命令输出，
+// 不应再切命令。
+func (vt *virtualTerminal) handleSemanticMarker(sub string) {
+	if sub == "" {
+		return
+	}
+	switch sub[0] {
+	case 'A', 'C', 'D':
+		vt.cmdZoneActive = false
+	case 'B':
+		vt.cmdZoneActive = true
+		vt.cmdZoneRow = vt.rows
+		vt.cmdZoneCol = vt.getCurrentRow().index
+	}
+}
+
 // commitLogicalLine 在硬 LF 触发时把当前行（含其连续的软 wrap 上游行）拼成一条
 // 逻辑行，连同提交时刻的 mode 快照一起暂存到 pendingLines，等 Advance 解锁后回放。
+// 处于 OSC 133 命令输入区时，额外从 B 标记的光标列起切出精确命令文本。
 func (vt *virtualTerminal) commitLogicalLine() {
 	if vt.lineHandler == nil {
 		return
@@ -495,13 +643,30 @@ func (vt *virtualTerminal) commitLogicalLine() {
 	for i := start; i <= end; i++ {
 		b.WriteString(vt.rowList[i].String())
 	}
+	// OSC 133：逻辑行起点与 B 快照行一致时，首物理行从 B 列起切，后续
+	// wrap 行整行拼接——Tab 补全重绘会覆盖行内容但 B 列不变，切出的
+	// 命令始终是最终形态。引号续行时首段照常切出（正则兜底对续行同样
+	// 只能拿到首段，两者行为对齐）。
+	var cmd string
+	if vt.cmdZoneActive && start == vt.cmdZoneRow {
+		var cb strings.Builder
+		cb.WriteString(vt.rowList[start].textFromCol(vt.cmdZoneCol))
+		for i := start + 1; i <= end; i++ {
+			cb.WriteString(vt.rowList[i].String())
+		}
+		cmd = cb.String()
+	}
+	// 命令输入区只在首个 LF 上切分——C/A/D 会关闭区域，但流异常时
+	// （C 丢失）靠这里自关闭，避免区域泄漏到命令输出行。
+	vt.cmdZoneActive = false
 	snap := make(ModeSnapshot, len(vt.privateModes))
 	for k, v := range vt.privateModes {
 		snap[k] = v
 	}
 	vt.pendingLines = append(vt.pendingLines, pendingLine{
-		line:  b.String(),
-		modes: snap,
+		line:    b.String(),
+		modes:   snap,
+		cmdText: cmd,
 	})
 }
 
@@ -538,6 +703,9 @@ func (vt *virtualTerminal) getNumberOrDefault(params []rune, index, _default int
 
 // appendCharacter 追加一个可打印字符。宽度按显示宽度计算（CJK 等
 // 宽字符占 2 列，组合字符等零宽字符按 1 列处理），cols>0 时按显示宽度软 wrap。
+// cols==0 时虽然没有列宽，物理行仍以 maxRowRunes 为界强制软 wrap——
+// 防止无换行的超长输出把单行 data 撑到无限大；wrap 段标记 wrappedFromPrev，
+// 行提交时仍拼回完整逻辑行。
 func (vt *virtualTerminal) appendCharacter(code rune) {
 	w := runeWidth(code)
 	if vt.cols > 0 {
@@ -548,6 +716,10 @@ func (vt *virtualTerminal) appendCharacter(code rune) {
 			vt.setCol(0)
 			vt.getCurrentRow().wrappedFromPrev = true
 		}
+	} else if row := vt.getCurrentRow(); len(row.data)+w > maxRowRunes {
+		vt.moveDown(1)
+		vt.setCol(0)
+		vt.getCurrentRow().wrappedFromPrev = true
 	}
 	vt.getCurrentRow().append(code, w)
 }
@@ -565,7 +737,7 @@ func (vt *virtualTerminal) Advance(p []byte) {
 	// 回调在锁外执行，避免 handler 阻塞影响其它读写
 	if handler != nil {
 		for _, pl := range pending {
-			handler(LineEvent{Line: pl.line, Modes: pl.modes})
+			handler(LineEvent{Line: pl.line, Modes: pl.modes, CmdText: pl.cmdText})
 		}
 	}
 }
@@ -599,6 +771,7 @@ func (vt *virtualTerminal) Reset() {
 
 // ResetScreen 仅重置屏幕状态——保留私有模式（如 ?2004 readline、?1049
 // alt screen），避免清掉后下一条 LineEvent 的 Modes 快照失真。
+// 两块屏都清空并回到 main 屏。
 func (vt *virtualTerminal) ResetScreen() {
 	vt.Lock()
 	defer vt.Unlock()
@@ -608,13 +781,10 @@ func (vt *virtualTerminal) ResetScreen() {
 
 // resetScreenLocked 假定调用方已持有写锁。
 func (vt *virtualTerminal) resetScreenLocked() {
-	for i := range vt.rowList {
-		if vt.rowList[i] != nil {
-			vt.rowList[i].data = nil
-			vt.rowList[i] = nil
-		}
-	}
-	vt.rowList = make([]*Row, 0)
-	vt.rows = 0
+	vt.mainScr = screenState{}
+	vt.altScr = screenState{}
+	vt.screenState = &vt.mainScr
+	vt.inAltScreen = false
+	vt.cmdZoneActive = false
 	vt.pendingLines = nil
 }
