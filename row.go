@@ -17,6 +17,11 @@ func (r *Row) setIndex(index int) {
 	if index < 0 {
 		index = 0
 	}
+	// 巨型跳列钳制（CSI G/`/a/C 等）：不超过已有内容与 maxScreenDim 的
+	// 较大者，否则后续写入时按 index 补齐空格会一次性分配天文数字内存
+	if index > max(len(r.data), maxScreenDim) {
+		index = max(len(r.data), maxScreenDim)
+	}
 	r.index = index
 }
 

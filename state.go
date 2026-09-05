@@ -19,6 +19,12 @@ func (vt *virtualTerminal) setRow(row int) {
 	if row < 0 {
 		row = 0
 	}
+	// 巨型跳行钳制：不超过已有行数与 maxScreenDim 的较大者（见常量注释）。
+	// 否则 CSI 2147483646;1H 这类序列会把 vt.rows 推到 21 亿，
+	// 下一次 getCurrentRow 循环建行直接把进程撑爆。
+	if row > max(len(vt.rowList), maxScreenDim) {
+		row = max(len(vt.rowList), maxScreenDim)
+	}
 	vt.rows = row
 }
 
@@ -38,6 +44,11 @@ func (vt *virtualTerminal) moveUp(ps int) {
 
 func (vt *virtualTerminal) moveDown(ps int) {
 	vt.rows += ps
+	// 与 setRow 相同的钳制：单次下移（含 CUD/CNL 巨型参数）最多落到
+	// 已有行数与 maxScreenDim 的较大者；LF 每次 +1 始终在界内，不受影响
+	if vt.rows > max(len(vt.rowList), maxScreenDim) {
+		vt.rows = max(len(vt.rowList), maxScreenDim)
+	}
 }
 
 func (vt *virtualTerminal) moveBackward(ps int) {

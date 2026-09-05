@@ -844,3 +844,66 @@ func TestCsiParamsSubparamRoundTrip(t *testing.T) {
 		t.Errorf("got %q, want %q", got, "38:2:1:2:3;4")
 	}
 }
+
+// ---------- 审计修复回归：巨型行/列跳转钳制 ----------
+
+func TestHugeCursorPositionIsBounded(t *testing.T) {
+	// CUP 巨型行参数：不物化 21 亿空行，单次最多落到 maxScreenDim
+	v := New()
+	v.Advance([]byte("\x1b[2147483646;1H"))
+	v.Advance([]byte("X"))
+	out := v.Output()
+	if len(out) != maxScreenDim+1 {
+		t.Fatalf("rows: got %d, want %d", len(out), maxScreenDim+1)
+	}
+	if out[maxScreenDim] != "X" {
+		t.Errorf("last line: got %q, want X", out[maxScreenDim])
+	}
+}
+
+func TestHugeCursorJumpRepetitionIsBounded(t *testing.T) {
+	// 重复发送巨型跳行不会持续放大：第二次起被已有行数卡住
+	v := New()
+	v.Advance([]byte("\x1b[2147483646;1H\x1b[2147483646;1H"))
+	v.Advance([]byte("X"))
+	if n := len(v.Output()); n > maxScreenDim+2 {
+		t.Errorf("rows grew to %d after repeated jumps, want <= %d", n, maxScreenDim+2)
+	}
+}
+
+func TestHugeCUDIsBounded(t *testing.T) {
+	// CUD (CSI B) 巨型参数与 CUP 同样钳制
+	v := New()
+	v.Advance([]byte("\x1b[2147483640B"))
+	v.Advance([]byte("X"))
+	if n := len(v.Output()); n != maxScreenDim+1 {
+		t.Errorf("rows: got %d, want %d", n, maxScreenDim+1)
+	}
+}
+
+func TestHugeColumnIsBounded(t *testing.T) {
+	// 巨型跳列（CHA/CUF）：后续写入的空白补齐以 maxScreenDim 为界
+	v := New()
+	v.Advance([]byte("\x1b[2147483640G"))
+	v.Advance([]byte("X"))
+	want := strings.Repeat(" ", maxScreenDim) + "X"
+	if got := v.Output()[0]; got != want {
+		t.Errorf("CHA: got %d chars, want %d", len(got), len(want))
+	}
+
+	v2 := New()
+	v2.Advance([]byte("\x1b[2147483640C"))
+	v2.Advance([]byte("X"))
+	if got := v2.Output()[0]; got != want {
+		t.Errorf("CUF: got %d chars, want %d", len(got), len(want))
+	}
+}
+
+func TestRowGrowthViaLFIsUnbounded(t *testing.T) {
+	// LF 驱动的滚动增长不受钳制影响（钳制只拦"单次巨型跳转"）
+	v := New()
+	v.Advance([]byte(strings.Repeat("\n", maxScreenDim+10)))
+	if n := len(v.Output()); n != maxScreenDim+11 {
+		t.Errorf("rows: got %d, want %d", n, maxScreenDim+11)
+	}
+}

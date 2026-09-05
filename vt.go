@@ -40,6 +40,14 @@ const maxStringDataSize = 1024 * 1024
 // 天文数字级的内存分配与循环。cols>0 时以 cols 为准。
 const maxInsertCells = 1 << 20
 
+// maxScreenDim 钳制行/列位置跳转（CUP/CUD/VPA/CHA/CUF 等）的上界。
+// termios winsize 的行列都是 uint16，真实终端屏幕不会超过 65535 行/列，
+// 更大的定位参数只会来自畸形或恶意输出。钳制规则是"不超过已有内容与该
+// 上界的较大者"：屏幕内的正常跳转不受影响，LF 驱动的滚动增长不设限，
+// 而巨型跳转（如 CSI 2147483646;1H）单次最多物化 65537 个空行，重复
+// 发送会被已有内容长度卡住，不会持续放大内存。
+const maxScreenDim = 1 << 16
+
 type inputHandler func(params []rune) error
 
 // LineEvent 是每次硬 LF 时 LineHandler 收到的事件。
