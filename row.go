@@ -1,9 +1,8 @@
 package vt
 
 import (
+	"slices"
 	"strings"
-
-	"github.com/mattn/go-runewidth"
 )
 
 type Row struct {
@@ -26,7 +25,7 @@ func (r *Row) setIndex(index int) {
 // 覆盖模式下若写在前一个宽字符的占位列上，先把宽字符清成空格（xterm 语义）。
 func (r *Row) append(code rune, w int) {
 	if r.index < len(r.data) {
-		if r.index > 0 && runewidth.RuneWidth(r.data[r.index-1]) > 1 {
+		if r.index > 0 && runeWidth(r.data[r.index-1]) > 1 {
 			r.data[r.index-1] = space
 		}
 		r.data[r.index] = code
@@ -57,26 +56,81 @@ func (r *Row) moveLeft() {
 	}
 }
 
-// 向下标位置插入字符
-func (r *Row) insert(code ...rune) {
-	for _, c := range code {
-		if r.index < 0 {
-			r.index = 0
+// isWideLead 报告 data[i] 是否是一个占两列的宽字符（CJK 等）。
+// 行不变式：宽字符在 data 中必然紧跟一个占位空格，因此宽度 >1 即 lead。
+func isWideLead(data []rune, i int) bool {
+	return runeWidth(data[i]) > 1
+}
+
+// eraseCells 用空格覆盖从光标开始的 n 个显示单元（ECH），后续内容保持原位。
+// 宽字符按整字符覆盖（无法半擦除）；循环以行内剩余单元数为上界，
+// 畸形超大参数（如 CSI 2147483647 X）不会造成长时间循环。
+func (r *Row) eraseCells(n int) {
+	i := r.index
+	if n <= 0 || i < 0 || i >= len(r.data) {
+		return
+	}
+	// 光标落在宽字符的占位单元上：先把它的 lead 清成空格
+	if i > 0 && isWideLead(r.data, i-1) {
+		r.data[i-1] = space
+	}
+	for i < len(r.data) && n > 0 {
+		w := runeWidth(r.data[i])
+		r.data[i] = space
+		if w > 1 && i+1 < len(r.data) {
+			r.data[i+1] = space
+			i++
 		}
-		if r.index > len(r.data) {
-			r.index = len(r.data)
-		}
-		r.data = insert(r.data, r.index, c)
-		r.index++ // 插入后光标向右移动
+		i++
+		n -= w
 	}
 }
 
-// 从下标位置删除N个字符
-func (r *Row) delete(ps int) {
-	if r.index < 0 || r.index >= len(r.data) || ps <= 0 {
+// deleteCells 从光标开始删除 n 个显示单元（DCH），后续内容左移。
+// 宽字符成对删除（无法拆分）；光标落在占位单元上时先清掉 lead。
+// 循环以行内剩余单元数为上界。
+func (r *Row) deleteCells(n int) {
+	start := r.index
+	if n <= 0 || start < 0 || start >= len(r.data) {
 		return
 	}
-	r.data = remove(r.data, r.index, ps)
+	if start > 0 && isWideLead(r.data, start-1) {
+		r.data[start-1] = space
+	}
+	end := start
+	for end < len(r.data) && n > 0 {
+		w := runeWidth(r.data[end])
+		end++
+		if w > 1 {
+			end++ // 占位空格随宽字符一起删除
+		}
+		n -= w
+	}
+	r.data = append(r.data[:start], r.data[end:]...)
+}
+
+// insertCells 在光标处插入 n 个空白显示单元（ICH），后续内容右移。
+// 一次批量拼接，避免逐字符插入的二次复杂度；插入点落在宽字符的占位
+// 单元上时先清掉该宽字符（无法拆分）。
+func (r *Row) insertCells(n int) {
+	if n <= 0 {
+		return
+	}
+	idx := r.index
+	if idx < 0 {
+		idx = 0
+	}
+	if idx > len(r.data) {
+		// 光标超出行尾：先补空格对齐，避免插入位置错列
+		for len(r.data) < idx {
+			r.data = append(r.data, space)
+		}
+	}
+	if idx > 0 && isWideLead(r.data, idx-1) {
+		r.data[idx-1] = space
+	}
+	r.data = slices.Insert(r.data, idx, slices.Repeat([]rune{space}, n)...)
+	r.index += n
 }
 
 // 删除当前光标所在位置右侧的字符
@@ -102,7 +156,7 @@ func (r *Row) String() string {
 	var b strings.Builder
 	for i, c := range r.data {
 		// 宽字符的占位空格不输出：我们的不变式是宽字符后必然紧跟其占位空格
-		if c == space && i > 0 && runewidth.RuneWidth(r.data[i-1]) > 1 {
+		if c == space && i > 0 && runeWidth(r.data[i-1]) > 1 {
 			continue
 		}
 		b.WriteRune(c)

@@ -10,7 +10,6 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/ansi/parser"
-	"github.com/mattn/go-runewidth"
 )
 
 const (
@@ -35,6 +34,11 @@ const (
 // maxStringDataSize 限制单个 OSC/DCS 等 string sequence 的 payload 大小，
 // 防止畸形超长序列撑爆内存。1MB 远超正常 OSC（标题、CurrentDir 等）的体积。
 const maxStringDataSize = 1024 * 1024
+
+// maxInsertCells 限制 ICH (CSI @) 单次插入的空白单元数——cols==0 没有行宽
+// 可钳制时生效，防止 12 字节的畸形序列（如 CSI 2147483647 @）放大成
+// 天文数字级的内存分配与循环。cols>0 时以 cols 为准。
+const maxInsertCells = 1 << 20
 
 type inputHandler func(params []rune) error
 
@@ -163,8 +167,9 @@ type virtualTerminal struct {
 
 	oscHandler OSCHandler
 
-	tabstops       map[int]bool // 显式设置的制表位（HTS 添加、TBC 移除）
-	defaultTabGrid bool         // 是否启用每 8 列的默认制表位网格（TBC 3 关闭）
+	tabstops        map[int]bool // 显式设置的制表位（HTS 添加、TBC 移除）
+	clearedTabStops map[int]bool // 被 TBC 0 清除的默认网格位（nextTab/prevTab 跳过）
+	defaultTabGrid  bool         // 是否启用每 8 列的默认制表位网格（TBC 3 关闭）
 
 	hasSavedCursor bool // ESC 7 保存的光标状态
 	savedRow       int
@@ -241,21 +246,24 @@ func (vt *virtualTerminal) initParser() {
 
 // csiParams 把解析器产出的结构化参数还原为现有 CSI handler 使用的
 // []rune 参数串：私有标记前缀（如 '?'）+ 分号分隔的参数。
-// 子参数（冒号分隔）按 x/ansi 的方式还原，现有 handler 均不使用子参数。
+// 子参数（冒号分隔）按 x/ansi 的打包方式还原：两个参数之间的分隔符取决于
+// 前一个参数是否带 HasMore 标志（其后跟的是 ':' 还是 ';'）。
 func csiParams(cmd ansi.Cmd, params ansi.Params) []rune {
 	var b strings.Builder
 	if p := cmd.Prefix(); p != 0 {
 		b.WriteByte(p)
 	}
+	prevMore := false
 	params.ForEach(0, func(i, param int, more bool) {
 		if i > 0 {
-			if more {
+			if prevMore {
 				b.WriteByte(':')
 			} else {
 				b.WriteByte(';')
 			}
 		}
 		b.WriteString(strconv.Itoa(param))
+		prevMore = more
 	})
 	return []rune(b.String())
 }
@@ -322,8 +330,10 @@ func (vt *virtualTerminal) handleEsc(cmd ansi.Cmd) {
 		vt.setCol(0)
 	case 'M': // RI 反向索引：上移一行
 		vt.moveUp(1)
-	case 'H': // HTS 在当前列设置制表位
-		vt.tabstops[vt.getCurrentRow().index] = true
+	case 'H': // HTS 在当前列设置制表位（重新启用被 TBC 0 清除的网格位）
+		col := vt.getCurrentRow().index
+		vt.tabstops[col] = true
+		delete(vt.clearedTabStops, col)
 	case 'c': // RIS 完全复位：等价 Reset（屏幕 + 私有模式 + 保存的光标 + 制表位）
 		vt.resetScreenLocked()
 		vt.privateModes = make(map[int]bool)
@@ -335,51 +345,117 @@ func (vt *virtualTerminal) handleEsc(cmd ansi.Cmd) {
 // resetTabStops 把制表位恢复为默认的每 8 列网格。
 func (vt *virtualTerminal) resetTabStops() {
 	vt.tabstops = make(map[int]bool)
+	vt.clearedTabStops = make(map[int]bool)
 	vt.defaultTabGrid = true
 }
 
-// nextTab 光标移到之后第 n 个制表位。候选位取默认网格与显式设置（HTS）中
-// 更近的一个；没有可用制表位时，cols>0 则移到最后一列（xterm 语义），否则原地不动。
+// setTabCol 按制表位移动设置列：cols>0 时钳制到最后一列（xterm 语义）。
+func (vt *virtualTerminal) setTabCol(col int) {
+	if vt.cols > 0 && col > vt.cols-1 {
+		col = vt.cols - 1
+	}
+	vt.setCol(col)
+}
+
+// nextTab 光标移到之后第 n 个制表位。
+//
+// 制表位有两类：默认每 8 列的网格，以及 HTS 显式设置（TBC 0 可清除，记录在
+// clearedTabStops）的位。显式位与被清除的网格位都是有限个；每越过其中一个，
+// 就进入一段不含任何特殊位的纯网格区间——等差数列，剩余步数直接算出。
+// 因此无论 n 多大（如畸形的 CSI 2147483647 I），开销都只与特殊位个数相关，
+// 不会长时间占用写锁。没有可用制表位时，cols>0 则移到最后一列，否则原地不动。
 func (vt *virtualTerminal) nextTab(n int) {
 	row := vt.getCurrentRow()
-	for range n {
-		next := 0
-		if vt.defaultTabGrid {
-			// 光标在 15 列 → 下一个 stop 是 16；恰好在 stop 上（16）→ 跳到 24
-			next = ((row.index / defaultTabStop) + 1) * defaultTabStop
-		}
-		for stop := range vt.tabstops {
-			if stop > row.index && (next == 0 || stop < next) {
-				next = stop
+	for n > 0 {
+		// 光标前方最近的特殊位（显式制表位或被清除的网格位）
+		special := 0
+		for s := range vt.tabstops {
+			if s > row.index && (special == 0 || s < special) {
+				special = s
 			}
 		}
-		if next == 0 {
+		for s := range vt.clearedTabStops {
+			if s > row.index && (special == 0 || s < special) {
+				special = s
+			}
+		}
+		if vt.defaultTabGrid {
+			// (row.index, special) 区间内只剩等距网格位，可整段批量消费；
+			// 前方没有特殊位时，剩余的全部步数都在网格上，一次算出
+			k := n
+			if special > 0 {
+				k = (special-1)/defaultTabStop - row.index/defaultTabStop
+			}
+			if n <= k {
+				vt.setTabCol((row.index/defaultTabStop + n) * defaultTabStop)
+				return
+			}
+			n -= k
+		}
+		if special == 0 {
+			// 前方已无任何制表位：cols>0 时移到最后一列（xterm 语义），否则原地不动
 			if vt.cols > 0 && row.index < vt.cols-1 {
 				vt.setCol(vt.cols - 1)
 			}
 			return
 		}
-		if vt.cols > 0 && next > vt.cols-1 {
-			next = vt.cols - 1
+		if vt.cols > 0 && special > vt.cols-1 {
+			// 特殊位已在行宽之外：到最后一列为止
+			vt.setCol(vt.cols - 1)
+			return
 		}
-		vt.setCol(next)
+		// 落到 special 上：显式制表位消耗一步，被清除的网格位只是路过
+		if vt.tabstops[special] {
+			if n == 1 {
+				vt.setTabCol(special)
+				return
+			}
+			n--
+		}
+		row.index = special
 	}
 }
 
 // prevTab 光标移到之前第 n 个制表位，没有更靠前的制表位时停在行首。
+// 与 nextTab 相同的分段策略：越过有限个特殊位（显式制表位 / 被清除的网格位）
+// 之后是纯网格等差区间，整段批量消费，n 再大也不会长时间循环。
 func (vt *virtualTerminal) prevTab(n int) {
 	row := vt.getCurrentRow()
-	for range n {
-		prev := 0
-		if vt.defaultTabGrid && row.index > 0 {
-			prev = ((row.index - 1) / defaultTabStop) * defaultTabStop
-		}
-		for stop := range vt.tabstops {
-			if stop < row.index && stop > prev {
-				prev = stop
+	for n > 0 && row.index > 0 {
+		// 光标后方最近的特殊位
+		special := 0
+		for s := range vt.tabstops {
+			if s < row.index && s > special {
+				special = s
 			}
 		}
-		vt.setCol(prev)
+		for s := range vt.clearedTabStops {
+			if s < row.index && s > special {
+				special = s
+			}
+		}
+		if vt.defaultTabGrid {
+			// (special, row.index) 区间内只剩等距网格位，整段批量消费
+			k := (row.index-1)/defaultTabStop - special/defaultTabStop
+			if n <= k {
+				vt.setCol(((row.index-1)/defaultTabStop - (n - 1)) * defaultTabStop)
+				return
+			}
+			n -= k
+		}
+		// 落到 special 上：显式制表位消耗一步，被清除的网格位只是路过
+		if vt.tabstops[special] {
+			if n == 1 {
+				vt.setCol(special)
+				return
+			}
+			n--
+		}
+		if special == 0 {
+			vt.setCol(0) // 已无更靠前的制表位，停在行首
+			return
+		}
+		row.index = special
 	}
 }
 
@@ -455,10 +531,7 @@ func (vt *virtualTerminal) getNumberOrDefault(params []rune, index, _default int
 // appendCharacter 追加一个可打印字符。宽度按显示宽度计算（CJK 等
 // 宽字符占 2 列，组合字符等零宽字符按 1 列处理），cols>0 时按显示宽度软 wrap。
 func (vt *virtualTerminal) appendCharacter(code rune) {
-	w := runewidth.RuneWidth(code)
-	if w < 1 {
-		w = 1
-	}
+	w := runeWidth(code)
 	if vt.cols > 0 {
 		row := vt.getCurrentRow()
 		if row.index+w > vt.cols {

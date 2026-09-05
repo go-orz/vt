@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 func feed(t *testing.T, s string) []string {
@@ -695,8 +697,8 @@ func TestWideCharOverwriteSecondHalfClearsLead(t *testing.T) {
 	// 提取文本应为 "中 X"（占位空格不进入文本，与终端复制行为一致）。
 	v := New()
 	v.Advance([]byte("中文")) // data=[中,' ',文,' ']，光标列 4
-	v.Advance([]byte("\b"))  // 光标到"文"的占位列（列 3）
-	v.Advance([]byte("X"))   // "文" 清成空格，X 写在列 3
+	v.Advance([]byte("\b")) // 光标到"文"的占位列（列 3）
+	v.Advance([]byte("X"))  // "文" 清成空格，X 写在列 3
 	if got := v.Output()[0]; got != "中 X" {
 		t.Errorf("got %q, want %q", got, "中 X")
 	}
@@ -718,4 +720,127 @@ func TestTabFromColumnAdjacentToStop(t *testing.T) {
 	v.Advance([]byte("$ echo 中文目录")) // 恰好 15 列
 	v.Advance([]byte("\tX"))
 	mustEqualLines(t, v.Output(), []string{"$ echo 中文目录 X"})
+}
+
+// ---------- 审计修复回归：制表位清除 / 超大参数 / 宽字符 cell 语义 ----------
+
+func TestTBC0ClearsDefaultGridStop(t *testing.T) {
+	// TBC 0 (CSI g) 必须能清掉默认网格上的制表位：
+	// 在 col 8 清除后，从行首 Tab 应直接跳到 col 16（xterm 语义）
+	v := New()
+	v.Advance([]byte("aaaaaaaa")) // 光标 col 8（默认网格位）
+	v.Advance([]byte("\x1b[0g"))  // 清除 col 8 的制表位
+	v.Advance([]byte("\x1b[1G\tX"))
+	want := "aaaaaaaa" + strings.Repeat(" ", 8) + "X" // X 落在 col 16
+	if got := v.Output()[0]; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestHTSRestoresClearedGridStop(t *testing.T) {
+	// HTS (ESC H) 重新设置被 TBC 0 清除的网格位
+	v := New()
+	v.Advance([]byte("aaaaaaaa\x1b[0g")) // 清除 col 8 的网格位
+	v.Advance([]byte("\x1bH"))           // HTS 重新在 col 8 设位
+	v.Advance([]byte("\x1b[1G\tX"))
+	if got := v.Output()[0]; got != "aaaaaaaaX" {
+		t.Errorf("got %q, want X at col 8", got)
+	}
+}
+
+func TestHugeTabParamsAreBounded(t *testing.T) {
+	// 畸形超大参数（近 2^31）不应造成长时间循环：
+	// cols 内 CHT 直达最后一列；无 cols 时前进再后退应回到原位
+	v := NewWithOptions(WithCols(20))
+	v.Advance([]byte("\x1b[2147483640IX"))
+	if got := v.Output()[0]; got != strings.Repeat(" ", 19)+"X" {
+		t.Errorf("CHT clamp to last col: got %q", got)
+	}
+
+	v2 := New()
+	v2.Advance([]byte("abc"))
+	v2.Advance([]byte("\x1b[2147483640I")) // CHT 前进近 2^31 个制表位
+	v2.Advance([]byte("\x1b[2147483640Z")) // CBT 再后退近 2^31 个
+	v2.Advance([]byte("\rX"))
+	mustEqualLines(t, v2.Output(), []string{"Xbc"})
+}
+
+func TestHugeECHIsClampedToRow(t *testing.T) {
+	// ECH 的擦除范围以行内剩余单元为界，超大参数瞬间完成
+	v := New()
+	v.Advance([]byte("hello\x1b[1;2H"))
+	v.Advance([]byte("\x1b[2147483640X"))
+	mustEqualLines(t, v.Output(), []string{"h"})
+}
+
+func TestHugeICHIsCapped(t *testing.T) {
+	// cols==0 时 ICH 的插入量收敛到 maxInsertCells，
+	// 12 字节的畸形序列不能放大成天文数字的内存分配
+	v := New()
+	v.Advance([]byte("ab\x1b[1;2H")) // 光标移到 a 和 b 之间
+	v.Advance([]byte("\x1b[2147483640@"))
+	want := "a" + strings.Repeat(" ", 1<<20) + "b"
+	if got := v.Output()[0]; got != want {
+		t.Errorf("ICH cap: got %d chars, want %d", len(got), len(want))
+	}
+}
+
+func TestDCHWideCharKeepsColumnAlignment(t *testing.T) {
+	// DCH 作用于宽字符 lead 时整字符成对删除，后续列号不错位：
+	// 删除"文"后 X 左移 2 列，col 3（1-based）写 Y 应覆盖 X 而不是挤在后面
+	v := New()
+	v.Advance([]byte("中文X"))
+	v.Advance([]byte("\x1b[1;3H\x1b[1P"))
+	v.Advance([]byte("\x1b[1;3HY"))
+	mustEqualLines(t, v.Output(), []string{"中Y"})
+}
+
+func TestDCHFromWideCharPlaceholder(t *testing.T) {
+	// 光标在宽字符占位单元上 DCH：lead 清成空格（无法拆分），从光标处删 1 单元
+	v := New()
+	v.Advance([]byte("中X"))
+	v.Advance([]byte("\x1b[1;2H\x1b[1P"))
+	mustEqualLines(t, v.Output(), []string{" X"})
+}
+
+func TestECHWideCharCells(t *testing.T) {
+	// ECH 按显示单元擦除：宽字符整字符覆盖（无法半擦除）
+	v := New()
+	v.Advance([]byte("中文X\x1b[1;1H")) // 光标回到行首
+	v.Advance([]byte("\x1b[2X"))
+	mustEqualLines(t, v.Output(), []string{"  文X"})
+}
+
+func TestICHWideCharAlignment(t *testing.T) {
+	// ICH 在宽字符 lead 处插入空白单元：文X 整体右移 2 列，列号保持对齐
+	v := New()
+	v.Advance([]byte("中文X"))
+	v.Advance([]byte("\x1b[1;3H\x1b[2@"))
+	mustEqualLines(t, v.Output(), []string{"中  文X"})
+}
+
+func TestAmbiguousWidthIsLocaleIndependent(t *testing.T) {
+	// ± 是 East Asian Ambiguous 字符：必须固定按 1 列计算，
+	// 不随宿主 locale（go-runewidth 的全局 DefaultCondition）漂移
+	v := NewWithOptions(WithCols(4))
+	v.Advance([]byte("±±±±X"))
+	out := v.Output()
+	if len(out) != 2 || out[0] != "±±±±" || out[1] != "X" {
+		t.Errorf("got %q, want [±±±± X]", out)
+	}
+}
+
+func TestCsiParamsSubparamRoundTrip(t *testing.T) {
+	// 子参数（冒号）还原：分隔符取决于前一个参数的 HasMore 标志
+	params := ansi.ToParams([]int{
+		ansi.Parameter(38, true),
+		ansi.Parameter(2, true),
+		ansi.Parameter(1, true),
+		ansi.Parameter(2, true),
+		ansi.Parameter(3, false),
+		ansi.Parameter(4, false),
+	})
+	if got := string(csiParams(0, params)); got != "38:2:1:2:3;4" {
+		t.Errorf("got %q, want %q", got, "38:2:1:2:3;4")
+	}
 }

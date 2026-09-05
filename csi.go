@@ -43,15 +43,21 @@ func (vt *virtualTerminal) cursorChange(params []rune, action func(ps int)) {
 }
 
 // insert Ps (Blank) Character(s) (default = 1) (ICH).
+// 插入的是空白"显示单元"，宽字符成对右移。参数收敛到 cols（cols==0 时收敛到
+// maxInsertCells），防止畸形超大参数放大成超长循环或内存分配。
 func (vt *virtualTerminal) insertChar(params []rune) error {
-	row := vt.getCurrentRow()
 	ps := vt.getNumberOrDefault(params, 0, 1)
 	if ps == 0 {
 		ps = 1
 	}
-	for range ps {
-		row.insert(space)
+	if vt.cols > 0 {
+		if ps > vt.cols {
+			ps = vt.cols
+		}
+	} else if ps > maxInsertCells {
+		ps = maxInsertCells
 	}
+	vt.getCurrentRow().insertCells(ps)
 	return nil
 }
 
@@ -157,29 +163,24 @@ func (vt *virtualTerminal) eraseInLine(params []rune) error {
 }
 
 // Delete Ps Character(s) (default = 1) (DCH).
+// 按显示单元删除，宽字符成对左移（无法拆分）。
 func (vt *virtualTerminal) deleteChars(params []rune) error {
 	ps := vt.getNumberOrDefault(params, 0, 1)
 	if ps == 0 {
 		ps = 1
 	}
-	row := vt.getCurrentRow()
-	row.delete(ps)
+	vt.getCurrentRow().deleteCells(ps)
 	return nil
 }
 
 // Erase Ps Character(s) (default = 1) (ECH).
-// ECH 与 DCH 不同：它用空格覆盖 N 个字符，后续内容保持原位不左移。
+// ECH 与 DCH 不同：它用空格覆盖 N 个显示单元，后续内容保持原位不左移。
 func (vt *virtualTerminal) eraseChars(params []rune) error {
 	ps := vt.getNumberOrDefault(params, 0, 1)
 	if ps == 0 {
 		ps = 1
 	}
-	row := vt.getCurrentRow()
-	for i := range ps {
-		if idx := row.index + i; idx < len(row.data) {
-			row.data[idx] = space
-		}
-	}
+	vt.getCurrentRow().eraseCells(ps)
 	return nil
 }
 
@@ -243,14 +244,18 @@ func (vt *virtualTerminal) cursorBackwardTab(params []rune) error {
 	return nil
 }
 
-// Tab Clear (TBC, CSI Pn g)：0 清除当前列的制表位；3 清除全部制表位
-// （包括默认的 8 列网格，之后只有 HTS 重新设置的制表位生效）。
+// Tab Clear (TBC, CSI Pn g)：0 清除当前列的制表位——默认网格上的位记录到
+// clearedTabStops，nextTab/prevTab 计算网格位时跳过（重新 HTS 可恢复）；
+// 3 清除全部制表位（包括默认的 8 列网格，之后只有 HTS 重新设置的制表位生效）。
 func (vt *virtualTerminal) tabClear(params []rune) error {
 	switch vt.getNumberOrDefault(params, 0, 0) {
 	case 0:
-		delete(vt.tabstops, vt.getCurrentRow().index)
+		col := vt.getCurrentRow().index
+		delete(vt.tabstops, col)
+		vt.clearedTabStops[col] = true
 	case 3:
 		vt.tabstops = make(map[int]bool)
+		vt.clearedTabStops = make(map[int]bool)
 		vt.defaultTabGrid = false
 	}
 	return nil

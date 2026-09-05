@@ -1,39 +1,22 @@
 package vt
 
-// insert 向指定位置插入元素
-func insert(data []rune, index int, val rune) []rune {
-	if index < 0 {
-		index = 0
-	}
+import "github.com/mattn/go-runewidth"
 
-	if index > len(data) {
-		paddingSize := index - len(data)
-		padding := make([]rune, paddingSize)
-		for i := 0; i < paddingSize; i++ {
-			padding[i] = space
-		}
-		data = append(data, padding...)
-	}
+// widthCond 是包内自有的显示宽度判定条件：零值 Condition，EastAsianWidth 恒为
+// false（与 xterm 默认一致）。不直接用 runewidth.RuneWidth 是因为它读全局
+// DefaultCondition，后者在包 init 时按宿主 locale（LC_ALL/LC_CTYPE/LANG 为
+// ja/zh/ko）切换 EastAsianWidth——CJK locale 下歧义宽度字符（±、…、制表框线等）
+// 会被判成 2 列，同一输入在不同机器上的 wrap 与占位行为就会不一致。
+// 注意不能用 runewidth.NewCondition()：它拷贝的正是被 locale 污染后的全局值。
+// 宽度表与算法仍是 go-runewidth 的，这里只固定判定条件。
+var widthCond = &runewidth.Condition{}
 
-	if index >= len(data) {
-		return append(data, val)
+// runeWidth 返回 r 的显示宽度：宽字符（CJK 等）2 列，其余（含零宽组合字符）按 1 列。
+func runeWidth(r rune) int {
+	if widthCond.RuneWidth(r) > 1 {
+		return 2
 	}
-
-	// Insert in the middle
-	suffix := append([]rune{val}, data[index:]...)
-	return append(data[:index], suffix...)
-}
-
-// remove 从某个位置开始删除n个元素
-func remove(data []rune, index, num int) []rune {
-	if index < 0 || index >= len(data) || num <= 0 {
-		return data
-	}
-	end := index + num
-	if end > len(data) {
-		end = len(data)
-	}
-	return append(data[:index], data[end:]...)
+	return 1
 }
 
 /*
