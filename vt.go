@@ -3,6 +3,7 @@ package vt
 import (
 	"fmt"
 	"log"
+	"maps"
 	"strconv"
 	"strings"
 	"sync"
@@ -102,6 +103,8 @@ func (s ModeSnapshot) IsAltScreen() bool {
 type LineHandler func(LineEvent)
 
 type VirtualTerminal interface {
+	SnapshotCommand() CommandSnapshot
+	ResizeCols(cols int)
 	Advance(p []byte)
 	Output() []string
 	// Reset 重置全部状态：屏幕缓冲、光标、私有模式、待回放的行事件。
@@ -222,9 +225,9 @@ type virtualTerminal struct {
 	savedCol       int
 
 	// ?1049 专用的光标保存（DECSC 与 1049 是两套独立机制）
-	altSavedRow    int
-	altSavedCol    int
-	inAltScreen    bool // 当前是否处于 alt 屏（与 privateModes 位同步维护）
+	altSavedRow int
+	altSavedCol int
+	inAltScreen bool // 当前是否处于 alt 屏（与 privateModes 位同步维护）
 
 	// OSC 133 命令输入区状态（shell integration 语义）：
 	// 133;B 时光标位于命令输入起点（其左方即 prompt），快照 (row, col)
@@ -660,9 +663,7 @@ func (vt *virtualTerminal) commitLogicalLine() {
 	// （C 丢失）靠这里自关闭，避免区域泄漏到命令输出行。
 	vt.cmdZoneActive = false
 	snap := make(ModeSnapshot, len(vt.privateModes))
-	for k, v := range vt.privateModes {
-		snap[k] = v
-	}
+	maps.Copy(snap, vt.privateModes)
 	vt.pendingLines = append(vt.pendingLines, pendingLine{
 		line:    b.String(),
 		modes:   snap,
